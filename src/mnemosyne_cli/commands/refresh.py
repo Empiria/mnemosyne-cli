@@ -1,4 +1,4 @@
-"""mnemosyne refresh — rebuild container images and update qmd index."""
+"""mnemosyne refresh — pull container images and update qmd index."""
 
 from __future__ import annotations
 
@@ -8,58 +8,94 @@ import shutil
 import typer
 from rich.console import Console
 
+from pathlib import Path
+
 from mnemosyne_cli.lib import vault
 from mnemosyne_cli.lib.manifests import generate_learning_manifest
+
+# CLI repo root — only needed when --build is used
+_CLI_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 console = Console()
 error_console = Console(stderr=True, style="bold red")
 
 
 def run(
-    skip_images: bool = typer.Option(False, "--skip-images", help="Skip container image rebuild."),
+    skip_images: bool = typer.Option(False, "--skip-images", help="Skip container image pull/build."),
     skip_qmd: bool = typer.Option(False, "--skip-qmd", help="Skip qmd index update."),
+    build: bool = typer.Option(False, "--build", help="Build images locally from Containerfiles instead of pulling from registry."),
 ) -> None:
-    """Rebuild container images and refresh the qmd search index."""
+    """Pull container images from registry and refresh the qmd search index."""
     vault_path = vault.resolve_vault_path()
-    containers_dir = vault_path / "containers"
     failed = False
 
     # --- Container images ---
     if not skip_images:
-        console.rule("[bold cyan]Rebuilding container images[/bold cyan]")
+        if build:
+            console.rule("[bold cyan]Rebuilding container images[/bold cyan]")
 
-        base_dir = containers_dir / "base"
-        claude_dir = containers_dir / "claude"
+            containers_dir = _CLI_ROOT / "containers"
+            base_dir = containers_dir / "base"
+            claude_dir = containers_dir / "claude"
 
-        if not base_dir.exists() or not claude_dir.exists():
-            error_console.print(f"Container directories not found in {containers_dir}")
-            raise typer.Exit(1)
+            if not base_dir.exists() or not claude_dir.exists():
+                error_console.print(f"Container directories not found in {containers_dir}")
+                raise typer.Exit(1)
 
-        # Get git hash of last commit touching containers/ for build label
-        build_hash_result = subprocess.run(
-            ["git", "log", "-1", "--format=%H", "--", "containers/"],
-            cwd=str(vault_path), capture_output=True, text=True,
-        )
-        build_hash = build_hash_result.stdout.strip() or "unknown"
-
-        for name, path in [("mnemosyne-base", base_dir), ("mnemosyne-claude", claude_dir)]:
-            console.print(f"  Building [cyan]{name}[/cyan]...")
-            result = subprocess.run(
-                [
-                    "podman", "build",
-                    "--build-arg", f"MNEMOSYNE_BUILD_HASH={build_hash}",
-                    "-t", f"{name}:latest", str(path),
-                ],
-                text=True,
+            # Get git hash of last commit touching containers/ for build label
+            build_hash_result = subprocess.run(
+                ["git", "log", "-1", "--format=%H", "--", "containers/"],
+                cwd=str(vault_path), capture_output=True, text=True,
             )
-            if result.returncode != 0:
-                error_console.print(f"  [red]Failed[/red] to build {name}")
-                failed = True
-                break
-            else:
-                console.print(f"  [green]Built[/green] {name}")
+            build_hash = build_hash_result.stdout.strip() or "unknown"
+
+            for name, path in [("mnemosyne-base", base_dir), ("mnemosyne-claude", claude_dir)]:
+                console.print(f"  Building [cyan]{name}[/cyan]...")
+                result = subprocess.run(
+                    [
+                        "podman", "build",
+                        "--build-arg", f"MNEMOSYNE_BUILD_HASH={build_hash}",
+                        "-t", f"{name}:latest", str(path),
+                    ],
+                    text=True,
+                )
+                if result.returncode != 0:
+                    error_console.print(f"  [red]Failed[/red] to build {name}")
+                    failed = True
+                    break
+                else:
+                    console.print(f"  [green]Built[/green] {name}")
+        else:
+            console.rule("[bold cyan]Pulling container images[/bold cyan]")
+
+            for name in ["mnemosyne-base", "mnemosyne-claude"]:
+                registry_ref = f"ghcr.io/empiria/{name}:latest"
+                local_ref = f"localhost/{name}:latest"
+
+                console.print(f"  Pulling [cyan]{registry_ref}[/cyan]...")
+                result = subprocess.run(
+                    ["podman", "pull", registry_ref],
+                    text=True,
+                )
+                if result.returncode != 0:
+                    error_console.print(f"  [red]Failed[/red] to pull {name}")
+                    error_console.print("  Hint: if you see 403, run: podman login ghcr.io")
+                    failed = True
+                    break
+
+                console.print(f"  Tagging [cyan]{registry_ref}[/cyan] → [cyan]{local_ref}[/cyan]...")
+                tag_result = subprocess.run(
+                    ["podman", "tag", registry_ref, local_ref],
+                    text=True,
+                )
+                if tag_result.returncode != 0:
+                    error_console.print(f"  [red]Failed[/red] to tag {name}")
+                    failed = True
+                    break
+
+                console.print(f"  [green]Pulled[/green] {name}")
     else:
-        console.print("[dim]Skipping image rebuild.[/dim]")
+        console.print("[dim]Skipping image pull.[/dim]")
 
     # --- qmd index ---
     if not skip_qmd:
