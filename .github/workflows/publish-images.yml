@@ -44,6 +44,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: containers/base
+          file: containers/base/Containerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.base-meta.outputs.tags }}
@@ -66,6 +67,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: containers/claude
+          file: containers/claude/Containerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.claude-meta.outputs.tags }}
