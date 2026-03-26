@@ -1,5 +1,6 @@
 # --- Builder stage: install qmd and strip unused arch binaries (keep CUDA) ---
-FROM localhost/mnemosyne-base:latest AS qmd-builder
+ARG BASE_IMAGE=localhost/mnemosyne-base:latest
+FROM ${BASE_IMAGE} AS qmd-builder
 ARG TARGETARCH
 USER root
 RUN npm install -g @tobilu/qmd && \
@@ -12,7 +13,8 @@ RUN npm install -g @tobilu/qmd && \
     fi
 
 # --- Final stage ---
-FROM localhost/mnemosyne-base:latest AS claude
+ARG BASE_IMAGE=localhost/mnemosyne-base:latest
+FROM ${BASE_IMAGE} AS claude
 ARG TARGETARCH
 USER root
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
