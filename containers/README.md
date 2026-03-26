@@ -10,26 +10,33 @@ Podman container images for running autonomous Claude Code agents with `--danger
 | `mnemosyne-claude` | `claude/Containerfile` | Extends base: adds gh, ripgrep, uv, Claude Code, GSD |
 | `mnemosyne-hapi-hub` | `hapi-hub/Containerfile` | Standalone hapi relay hub for mobile access |
 
-## Building
+## Getting Images
 
-Build images in order (base first, then dependent images):
+Pre-built images are published to `ghcr.io/empiria` on every push to main. Pull them with:
 
 ```sh
-# Build base image
+mnemosyne refresh
+```
+
+This pulls both `mnemosyne-base` and `mnemosyne-claude` from the registry and tags them as `localhost/` for local use.
+
+### Building locally
+
+For contributors modifying Containerfiles:
+
+```sh
+mnemosyne refresh --build
+```
+
+Or manually, in order (base first, then dependent images):
+
+```sh
 podman build --platform linux/amd64 -t mnemosyne-base containers/base/
-
-# Build Claude agent image
 podman build --platform linux/amd64 -t mnemosyne-claude containers/claude/
-
-# Build hapi hub image
 podman build --platform linux/amd64 -t mnemosyne-hapi-hub containers/hapi-hub/
 ```
 
-For multi-arch builds (amd64 + arm64):
-
-```sh
-podman buildx build --platform linux/amd64,linux/arm64 -t mnemosyne-base containers/base/
-```
+The `claude/Containerfile` accepts a `BASE_IMAGE` build-arg (defaults to `localhost/mnemosyne-base:latest`). CI overrides this to `ghcr.io/empiria/mnemosyne-base:latest`.
 
 ## Running
 
