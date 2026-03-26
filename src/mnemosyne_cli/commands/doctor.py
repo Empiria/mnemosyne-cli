@@ -634,41 +634,42 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
     # --- Category: Freshness ---
 
     def check_images_fresh() -> CheckResult:
-        """Check if container images were built from the latest containers/ commit."""
+        """Check if local container images match the latest registry digest."""
         import shutil
 
         if not shutil.which("podman"):
             return CheckResult(ok=True, message="podman not found (skipped)")
 
-        # Get the git hash of the latest commit touching containers/ in the CLI repo
-        cli_root = _cli_repo_root()
-        cli_containers = cli_root / "containers"
-        if not cli_containers.is_dir():
-            return CheckResult(ok=True, message="containers/ not found in CLI repo (skipped)")
-
-        git_result = subprocess.run(
-            ["git", "log", "-1", "--format=%H", "--", "containers/"],
-            cwd=str(cli_root), capture_output=True, text=True,
-        )
-        expected_hash = git_result.stdout.strip()
-        if not expected_hash:
-            return CheckResult(ok=True, message="No commits touching containers/ (skipped)")
+        if not shutil.which("skopeo"):
+            return CheckResult(ok=True, message="skopeo not found -- cannot check registry freshness (skipped)")
 
         stale = []
         for name in ["mnemosyne-base", "mnemosyne-claude"]:
-            result = subprocess.run(
-                ["podman", "inspect", f"{name}:latest",
-                 "--format", "{{index .Config.Labels \"mnemosyne.build.hash\"}}"],
+            # Get local digest from the localhost/ tag that refresh creates
+            local_result = subprocess.run(
+                ["podman", "image", "inspect", f"localhost/{name}:latest",
+                 "--format", "{{index .RepoDigests 0}}"],
                 capture_output=True, text=True,
             )
-            if result.returncode != 0:
-                stale.append(f"{name} (not built)")
+            if local_result.returncode != 0:
+                stale.append(f"{name} (not pulled)")
                 continue
+            local_digest = local_result.stdout.strip() or None
 
-            image_hash = result.stdout.strip()
-            if image_hash != expected_hash:
-                short = expected_hash[:8]
-                stale.append(f"{name} (built from {image_hash[:8] or 'unknown'}, need {short})")
+            # Get remote digest from registry
+            remote_result = subprocess.run(
+                ["skopeo", "inspect", "--format", "{{.Digest}}",
+                 f"docker://ghcr.io/empiria/{name}:latest"],
+                capture_output=True, text=True,
+                timeout=15,
+            )
+            if remote_result.returncode != 0:
+                # Registry unreachable — skip, don't fail
+                continue
+            remote_digest = remote_result.stdout.strip()
+
+            if local_digest is None or remote_digest not in local_digest:
+                stale.append(f"{name} (out of date with registry)")
 
         if stale:
             return CheckResult(
@@ -676,7 +677,7 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                 message=f"Container image(s) stale: {', '.join(stale)}",
                 fix_cmd="mnemosyne refresh --skip-qmd",
             )
-        return CheckResult(ok=True, message=f"Container images up to date ({expected_hash[:8]})")
+        return CheckResult(ok=True, message="Container images up to date with registry")
 
     checks.append(Check(
         name="Container images up to date",
