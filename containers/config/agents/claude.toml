@@ -1,0 +1,10 @@
+# Shared agent config for Claude Code in Mnemosyne containers
+# Mounted at /config/agents/claude.toml — merged into ~/.claude/ by entrypoint
+
+[agent]
+shell = "/bin/bash"
+env_vars = ["PATH=/home/agent/.local/bin:$PATH", "SHELL=/bin/bash"]
+
+[session]
+# Default session command — used by zellij layout or mnemosyne agent start
+command = "claude-session"

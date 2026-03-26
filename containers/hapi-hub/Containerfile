@@ -1,0 +1,20 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash -u 1000 hapi
+ENV NPM_CONFIG_PREFIX=/home/hapi/.npm-global
+ENV PATH="/home/hapi/.npm-global/bin:$PATH"
+USER hapi
+RUN npm install -g @twsxtd/hapi
+RUN mkdir -p /home/hapi/.hapi
+COPY --chown=hapi:hapi --chmod=755 entrypoint.sh /entrypoint.sh
+ENV HAPI_MODE=relay
+ENV HAPI_LISTEN_HOST=0.0.0.0
+ENV HAPI_LISTEN_PORT=3006
+EXPOSE 3006
+VOLUME /home/hapi/.hapi
+ENTRYPOINT ["/entrypoint.sh"]

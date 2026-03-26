@@ -1,0 +1,60 @@
+FROM debian:bookworm-slim AS base
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git ca-certificates bash jq qrencode tmux \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+RUN npm install -g @twsxtd/hapi
+RUN case "${TARGETARCH}" in \
+      amd64) ZELLIJ_ARCH="x86_64-unknown-linux-musl" ;; \
+      arm64) ZELLIJ_ARCH="aarch64-unknown-linux-musl" ;; \
+      *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac && \
+    curl -sSL "https://github.com/zellij-org/zellij/releases/latest/download/zellij-${ZELLIJ_ARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin
+RUN case "${TARGETARCH}" in \
+      amd64) STARSHIP_ARCH="x86_64-unknown-linux-musl" ;; \
+      arm64) STARSHIP_ARCH="aarch64-unknown-linux-musl" ;; \
+      *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac && \
+    curl -sSL "https://github.com/starship/starship/releases/latest/download/starship-${STARSHIP_ARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin
+
+RUN useradd -m -s /bin/bash -u 1000 agent
+# sudo: passwordless for agent (container.toml run: commands may need root)
+RUN apt-get update && apt-get install -y --no-install-recommends sudo && \
+    echo "agent ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/agent && \
+    chmod 0440 /etc/sudoers.d/agent && \
+    rm -rf /var/lib/apt/lists/*
+COPY --chmod=755 entrypoint.sh /entrypoint.sh
+USER agent
+# uv + Python: managed environment instead of system python
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/home/agent/.local/bin:$PATH"
+RUN uv python install 3.13
+RUN uv venv /home/agent/.venv
+ENV VIRTUAL_ENV="/home/agent/.venv"
+ENV PATH="/home/agent/.venv/bin:$PATH"
+RUN mkdir -p ~/.local/bin ~/.config/zellij
+RUN printf '%s\n' \
+    'pane_frames false' \
+    'show_startup_tips false' \
+    'show_release_notes false' \
+    > ~/.config/zellij/config.kdl
+RUN printf '%s\n' \
+    '# ~/.bashrc for agent user' \
+    'if [[ $- == *i* ]]; then' \
+    '    eval "$(starship init bash)"' \
+    'fi' \
+    > ~/.bashrc
+ENV TERM=xterm-256color
+ENV COLORTERM=truecolor
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ARG MNEMOSYNE_BUILD_HASH=unknown
+LABEL mnemosyne.build.hash="${MNEMOSYNE_BUILD_HASH}"
+RUN echo "${MNEMOSYNE_BUILD_HASH}" > /home/agent/.build-hash
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sleep", "infinity"]

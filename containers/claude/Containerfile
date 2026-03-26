@@ -1,0 +1,75 @@
+# --- Builder stage: install qmd and strip unused arch binaries (keep CUDA) ---
+FROM localhost/mnemosyne-base:latest AS qmd-builder
+ARG TARGETARCH
+USER root
+RUN npm install -g @tobilu/qmd && \
+    rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/win-* \
+           /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/mac-* && \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-x64*; \
+    else \
+        rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-arm*; \
+    fi
+
+# --- Final stage ---
+FROM localhost/mnemosyne-base:latest AS claude
+ARG TARGETARCH
+USER root
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends gh ripgrep && \
+    rm -rf /var/lib/apt/lists/*
+# CUDA 13 runtime libs for node-llama-cpp GPU acceleration (requires host driver >=590)
+# Only available for x86_64 — skip on arm64
+RUN if [ "${TARGETARCH}" = "amd64" ]; then \
+        curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+            -o /tmp/cuda-keyring.deb && \
+        dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends cuda-cudart-13-0 libcublas-13-0 && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+# qmd: copy stripped package from builder stage
+COPY --from=qmd-builder /usr/lib/node_modules/@tobilu/qmd \
+     /usr/lib/node_modules/@tobilu/qmd
+RUN ln -s ../lib/node_modules/@tobilu/qmd/dist/qmd.js /usr/bin/qmd
+RUN npm install -g ctx7
+USER agent
+# Pre-create qmd cache dir so podman's read-only model mount doesn't make it root-owned
+RUN mkdir -p ~/.cache/qmd
+# rustup: Rust toolchain for cargo: dep section
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:$PATH"
+# Pre-create dep-cache subdirs so podman named volume is agent-owned on first mount
+RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
+RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN npx get-shit-done-cc --claude --global
+# Default flags for interactive `claude` in terminal sessions
+RUN echo 'alias claude="command claude --dangerously-skip-permissions --remote-control"' >> ~/.bashrc
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    '' \
+    '# Run remote-control in a retry loop in the background' \
+    '# Pipe "y" to auto-accept the first-run enable prompt' \
+    '(' \
+    '    while true; do' \
+    '        echo y | claude remote-control \' \
+    '            --spawn worktree \' \
+    '            --permission-mode bypassPermissions \' \
+    '            --no-create-session-in-dir' \
+    '        echo "WARNING: claude remote-control exited ($(date +%H:%M:%S)) — retrying in 10s"' \
+    '        sleep 10' \
+    '    done' \
+    ') &' \
+    '' \
+    '# Keep container alive regardless' \
+    'exec sleep infinity' \
+    > ~/.local/bin/claude-session && \
+    chmod +x ~/.local/bin/claude-session
+ARG MNEMOSYNE_BUILD_HASH=unknown
+LABEL mnemosyne.build.hash="${MNEMOSYNE_BUILD_HASH}"
+RUN echo "${MNEMOSYNE_BUILD_HASH}" > /home/agent/.build-hash
+ENV SHELL="/bin/bash"
+CMD ["claude-session"]

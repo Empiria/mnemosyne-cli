@@ -1,0 +1,7 @@
+// Shared Zellij config for Mnemosyne agent containers
+pane_frames false
+default_layout "agent"
+show_startup_tips false
+show_release_notes false
+mouse_mode false
+
