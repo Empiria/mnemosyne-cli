@@ -193,6 +193,11 @@ def start(
         "-d",
         help="Start container without attaching.",
     ),
+    cli_path: Optional[Path] = typer.Option(
+        None,
+        "--cli-path",
+        help="Path to local mnemosyne-cli repo for editable install. If omitted, CLI is installed from PyPI inside the container.",
+    ),
 ) -> None:
     """Launch an agent container for a project.
 
@@ -280,9 +285,6 @@ def start(
     else:
         console.print(f"  Vault worktree: worktrees/{project}/ (existing)")
 
-    # Container and volume paths — resolved from CLI repo, not the vault
-    containers_dir = _CLI_ROOT / "containers"
-
     # Build podman run command — always detached
     cmd: list[str] = [
         "podman",
@@ -303,12 +305,15 @@ def start(
         f"{vault_path}:/vault",
         "-v",
         f"{vault_path}:{vault_path}",
-        "-v",
-        f"{containers_dir}/config:/config:ro",
-        # Mount CLI repo for editable install and container config access
-        "-v",
-        f"{_CLI_ROOT}:/mnemosyne-cli:ro",
     ]
+
+    # Mount CLI repo for editable install when --cli-path is given;
+    # otherwise the entrypoint installs mnemosyne-cli from PyPI.
+    cli_root = cli_path.resolve() if cli_path else None
+    if cli_root:
+        containers_dir = cli_root / "containers"
+        cmd.extend(["-v", f"{containers_dir}/config:/config:ro"])
+        cmd.extend(["-v", f"{cli_root}:/mnemosyne-cli:ro"])
 
     # Pass credentials: full JSON from keychain preferred, access token as fallback
     if credentials_json:
