@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim AS base
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl git ca-certificates bash jq qrencode tmux \
+    curl git openssh-client ca-certificates bash jq qrencode tmux \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
