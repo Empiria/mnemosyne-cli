@@ -131,8 +131,8 @@ if command -v uv &>/dev/null; then
         if [[ -d /mnemosyne-cli/src/mnemosyne_cli ]]; then
             uv pip install -e /mnemosyne-cli/ 2>&1 || echo "WARN: mnemosyne CLI install failed (non-fatal)"
         else
-            echo "Installing mnemosyne-cli from PyPI..."
-            uv pip install mnemosyne-cli 2>&1 || echo "WARN: mnemosyne CLI install from PyPI failed (non-fatal)"
+            echo "Installing mnemosyne-cli from GitHub..."
+            uv pip install "mnemosyne-cli @ git+https://github.com/Empiria/mnemosyne-cli.git" 2>&1 || echo "WARN: mnemosyne CLI install from GitHub failed (non-fatal)"
         fi
     fi
 fi
