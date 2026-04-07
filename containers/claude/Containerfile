@@ -47,7 +47,6 @@ ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:$PATH"
 # Pre-create dep-cache subdirs so podman named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
 RUN curl -fsSL https://claude.ai/install.sh | bash
-RUN npx get-shit-done-cc --claude --global
 # Default flags for interactive `claude` in terminal sessions
 RUN echo 'alias claude="command claude --dangerously-skip-permissions --remote-control"' >> ~/.bashrc
 RUN printf '%s\n' \

@@ -7,7 +7,7 @@ Podman container images for running autonomous Claude Code agents with `--danger
 | Image | Containerfile | Purpose |
 |-------|---------------|---------|
 | `mnemosyne-base` | `base/Containerfile` | Debian bookworm-slim with Node 22, git, Starship, hapi |
-| `mnemosyne-claude` | `claude/Containerfile` | Extends base: adds gh, ripgrep, uv, Claude Code, GSD |
+| `mnemosyne-claude` | `claude/Containerfile` | Extends base: adds gh, ripgrep, uv, Claude Code, qmd, ctx7 |
 | `mnemosyne-hapi-hub` | `hapi-hub/Containerfile` | Standalone hapi relay hub for mobile access |
 
 ## Getting Images
