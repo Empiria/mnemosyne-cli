@@ -33,30 +33,30 @@ class AgentCommand:
 
 
 def discover_agent_commands(vault_path: Path) -> list[AgentCommand]:
-    """Scan agents/*/ for tool-specific command files.
+    """Scan agents/ recursively for tool-specific command files.
 
     Returns one AgentCommand per (agent, tool) pair found. Agents may have
     command files for multiple tools (e.g. both claude-code-command.md and
     opencode-command.md).
+
+    Supports any nesting depth (e.g. agents/skills/clio/) — any directory
+    containing a command file is treated as an agent.
     """
     agents_dir = vault_path / "agents"
     if not agents_dir.is_dir():
         return []
 
     commands: list[AgentCommand] = []
-    for agent_dir in sorted(agents_dir.iterdir()):
-        if not agent_dir.is_dir():
-            continue
-        for suffix, tool_dir in TOOL_COMMAND_DIRS.items():
-            cmd_file = agent_dir / suffix
-            if cmd_file.is_file():
-                commands.append(
-                    AgentCommand(
-                        agent_name=agent_dir.name,
-                        tool_dir=tool_dir,
-                        target=cmd_file,
-                    )
+    for suffix, tool_dir in TOOL_COMMAND_DIRS.items():
+        for cmd_file in sorted(agents_dir.rglob(suffix)):
+            agent_dir = cmd_file.parent
+            commands.append(
+                AgentCommand(
+                    agent_name=agent_dir.name,
+                    tool_dir=tool_dir,
+                    target=cmd_file,
                 )
+            )
     return commands
 
 

@@ -140,7 +140,7 @@ fi
 # Link vault agent commands into Claude Code (only claude-code-command.md files)
 if [[ -d /vault/agents ]]; then
     mkdir -p ~/.claude/commands
-    for cmd_file in /vault/agents/*/claude-code-command.md; do
+    for cmd_file in $(find /vault/agents -name claude-code-command.md 2>/dev/null); do
         [[ -f "$cmd_file" ]] || continue
         name=$(basename "$(dirname "$cmd_file")")
         ln -sf "$cmd_file" ~/.claude/commands/"$name".md

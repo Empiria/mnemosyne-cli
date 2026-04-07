@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import json
 import pathlib
 import re
@@ -70,7 +72,7 @@ def context_monitor() -> None:
     """
     WT,CT,SS,DC=35,25,60,5
     try:
-        raw=sys.stdin.read(); data:dict=json.loads(raw) if raw and raw.strip() else {}
+        raw=sys.stdin.read(); data:dict[str, Any]=json.loads(raw) if raw and raw.strip() else {}
     except(json.JSONDecodeError,OSError):
         data={}
     sid:str=data.get("session_id") or ""
@@ -86,15 +88,15 @@ def context_monitor() -> None:
             except(json.JSONDecodeError,OSError): pass
     tb=pathlib.Path(tempfile.gettempdir())/("claude-ctx-"+sid+".json")
     if not tb.exists(): raise typer.Exit(0)
-    try: metrics:dict=json.loads(tb.read_text())
+    try: metrics:dict[str, Any]=json.loads(tb.read_text())
     except(json.JSONDecodeError,OSError): raise typer.Exit(0)
     now=int(time.time())
-    if metrics.get("timestamp") and(now-metrics["timestamp"])>SS: raise typer.Exit(0)
-    rem:float=metrics.get("remaining_percentage",100)
-    used:int=metrics.get("used_pct",0)
+    if metrics.get("timestamp") and(now-int(metrics["timestamp"]))>SS: raise typer.Exit(0)
+    rem:float=float(metrics.get("remaining_percentage",100))
+    used:int=int(metrics.get("used_pct",0))
     if rem>WT: raise typer.Exit(0)
     wp=pathlib.Path(tempfile.gettempdir())/("claude-ctx-"+sid+"-warned.json")
-    wd:dict={"callsSinceWarn":0,"lastLevel":None}; fw=True
+    wd:dict[str, Any]={"callsSinceWarn":0,"lastLevel":None}; fw=True
     if wp.exists():
         try: wd=json.loads(wp.read_text()); fw=False
         except(json.JSONDecodeError,OSError): pass
@@ -120,12 +122,12 @@ def context_monitor() -> None:
 def prompt_guard() -> None:
     """PreToolUse hook: scan .planning/ writes for prompt injection patterns. Advisory only."""
     try:
-        raw=sys.stdin.read(); data:dict=json.loads(raw) if raw and raw.strip() else {}
+        raw=sys.stdin.read(); data:dict[str, Any]=json.loads(raw) if raw and raw.strip() else {}
     except(json.JSONDecodeError,OSError):
         data={}
     tn:str=data.get("tool_name") or ""
     if tn not in("Write","Edit"): sys.stdout.write(json.dumps({"decision":"allow"})); return
-    ti:dict=data.get("tool_input") or {}; fp:str=ti.get("file_path") or ""
+    ti:dict[str, Any]=data.get("tool_input") or {}; fp:str=ti.get("file_path") or ""
     if ".planning/" not in fp and ".planning\\" not in fp: sys.stdout.write(json.dumps({"decision":"allow"})); return
     ct:str=ti.get("content") or ti.get("new_string") or ""
     if not ct: sys.stdout.write(json.dumps({"decision":"allow"})); return
