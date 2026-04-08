@@ -15,13 +15,29 @@ from rich.table import Table
 from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import vault
 
-app = typer.Typer(no_args_is_help=True, help="Manage agent containers.")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="[DEPRECATED] Manage agent containers. Use SCION instead — see 'mnemosyne doctor' for migration status.",
+)
 console = Console()
 error_console = Console(stderr=True, style="bold red")
 
 # CLI repo root: this file lives at src/mnemosyne_cli/commands/agent.py
 # so four levels up (commands -> mnemosyne_cli -> src -> repo root)
 _CLI_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+_DEPRECATION_GUIDE = "https://github.com/Empiria/mnemosyne/blob/main/docs/how-to/scion-migration.md"
+
+
+def _deprecation_warning(old_cmd: str, new_cmd: str) -> None:
+    """Print a deprecation warning pointing to the SCION equivalent."""
+    console.print(
+        f"[yellow]DEPRECATED:[/yellow] 'mnemosyne agent {old_cmd}' is deprecated. "
+        f"Use SCION instead:\n"
+        f"  {new_cmd}\n"
+        f"See: {_DEPRECATION_GUIDE}\n"
+    )
+
 
 _AGENT_ENV_PATH = Path("~/.config/mnemosyne/agent.env").expanduser()
 _KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -204,6 +220,7 @@ def start(
     Without a branch argument, starts the container and prints the remote-control
     URL. With a branch, also attaches to a bash shell in that branch's worktree.
     """
+    _deprecation_warning("start", 'scion start <agent-name> "task" --template agents/scion-template')
     project = project or _default_project()
     vault_path = vault.resolve_vault_path()
     container_name = f"{_CONTAINER_PREFIX}{project}"
@@ -429,6 +446,7 @@ def start(
 @app.command("list")
 def list_agents() -> None:
     """List running agent containers."""
+    _deprecation_warning("list", "scion list")
     cmd = [
         "podman",
         "ps",
@@ -478,6 +496,7 @@ def stop(
     project: str = typer.Argument(None, help="Vault project slug. Defaults to current directory name."),
 ) -> None:
     """Stop and remove an agent container."""
+    _deprecation_warning("stop", "scion delete <agent-name>")
     project = project or _default_project()
     container_name = f"{_CONTAINER_PREFIX}{project}"
     result = subprocess.run(
@@ -523,6 +542,7 @@ def rebuild(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
 ) -> None:
     """Remove dependency cache and restart container for a project."""
+    _deprecation_warning("rebuild", "scion delete <agent> && scion start <agent> \"task\"")
     project = project or _default_project()
     dep_cache_vol = f"dep-cache-{project}"
     container_name = f"{_CONTAINER_PREFIX}{project}"
@@ -558,6 +578,7 @@ def hub(
     qr: bool = typer.Option(False, "--qr", help="Show QR code for mobile access."),
 ) -> None:
     """Start (or stop) the hapi hub for mobile access."""
+    _deprecation_warning("hub", "SCION Hub (replaces hapi hub for remote access)")
     if stop:
         result = subprocess.run(
             ["podman", "stop", _HAPI_HUB_CONTAINER],
@@ -752,6 +773,7 @@ def remote(
     project: str = typer.Argument(None, help="Vault project slug. Defaults to current directory name."),
 ) -> None:
     """Show the remote-control URL for connecting from browser or phone."""
+    _deprecation_warning("remote", "scion attach <agent-name> --web")
     project = project or _default_project()
     container_name = f"{_CONTAINER_PREFIX}{project}"
 
@@ -787,6 +809,7 @@ def attach(
     ),
 ) -> None:
     """Attach to a running agent container and resume a work session on a branch."""
+    _deprecation_warning("attach", "scion attach <agent-name>")
     project = project or _default_project()
     vault_path = vault.resolve_vault_path()
     container_name = f"{_CONTAINER_PREFIX}{project}"
