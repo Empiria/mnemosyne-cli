@@ -8,6 +8,7 @@ RUN npx playwright install-deps chromium
 USER scion
 
 # Playwright browser + pytest integration
-# Use full venv path — parent ENV may not propagate in all build contexts
-RUN /home/scion/.venv/bin/pip install pytest-playwright && \
-    /home/scion/.venv/bin/playwright install chromium
+# uv venv doesn't include pip — use uv pip to install into the venv
+ENV PATH="/home/scion/.local/bin:/home/scion/.venv/bin:$PATH"
+RUN uv pip install pytest-playwright && \
+    playwright install chromium
