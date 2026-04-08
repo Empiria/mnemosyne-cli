@@ -1,0 +1,12 @@
+ARG BASE_IMAGE=ghcr.io/empiria/empiria-claude:latest
+FROM ${BASE_IMAGE}
+USER root
+
+# Playwright system dependencies for browser testing
+RUN npx playwright install-deps chromium
+
+USER agent
+
+# Playwright browser + pytest integration
+RUN pip install pytest-playwright && \
+    playwright install chromium

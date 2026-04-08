@@ -1,0 +1,70 @@
+# --- Builder stage: install qmd and strip unused arch binaries (keep CUDA) ---
+ARG BASE_IMAGE=ghcr.io/googlecloudplatform/scion/scion-claude:latest
+FROM ${BASE_IMAGE} AS qmd-builder
+ARG TARGETARCH
+USER root
+RUN npm install -g @tobilu/qmd && \
+    rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/win-* \
+           /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/mac-* && \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-x64*; \
+    else \
+        rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-arm*; \
+    fi
+
+# --- Final stage ---
+ARG BASE_IMAGE=ghcr.io/googlecloudplatform/scion/scion-claude:latest
+FROM ${BASE_IMAGE}
+ARG TARGETARCH
+USER root
+
+# GitHub CLI + ripgrep
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends gh ripgrep && \
+    rm -rf /var/lib/apt/lists/*
+
+# CUDA 13 runtime libs for node-llama-cpp GPU acceleration (requires host driver >=590)
+# Only available for x86_64 — skip on arm64
+RUN if [ "${TARGETARCH}" = "amd64" ]; then \
+        curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+            -o /tmp/cuda-keyring.deb && \
+        dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends cuda-cudart-13-0 libcublas-13-0 && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# qmd: copy stripped package from builder stage
+COPY --from=qmd-builder /usr/lib/node_modules/@tobilu/qmd \
+     /usr/lib/node_modules/@tobilu/qmd
+RUN ln -s ../lib/node_modules/@tobilu/qmd/dist/qmd.js /usr/bin/qmd
+
+# ctx7: library documentation lookup
+RUN npm install -g ctx7
+
+USER agent
+
+# Pre-create qmd cache dir so volume mounts don't make it root-owned
+RUN mkdir -p ~/.cache/qmd
+
+# uv + Python: managed environment
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/home/agent/.local/bin:$PATH"
+RUN uv python install 3.13
+RUN uv venv /home/agent/.venv
+ENV VIRTUAL_ENV="/home/agent/.venv"
+ENV PATH="/home/agent/.venv/bin:$PATH"
+
+# rustup: Rust toolchain for cargo dependencies
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+ENV PATH="/home/agent/.cargo/bin:$PATH"
+
+# Pre-create dep-cache subdirs so named volume is agent-owned on first mount
+RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
+
+ENV SHELL="/bin/bash"
+ENTRYPOINT ["/home/agent/entrypoint.sh"]
+CMD ["bash"]
