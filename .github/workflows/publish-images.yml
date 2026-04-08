@@ -126,7 +126,7 @@ jobs:
         run: |
           image-build/scripts/build-images.sh \
             --registry "${{ env.REGISTRY }}/${{ env.ORG }}" \
-            --target all \
+            --target common \
             --tag latest \
             --platform linux/amd64 \
             --push
