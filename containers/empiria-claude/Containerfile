@@ -1,19 +1,6 @@
-# --- Builder stage: install qmd and strip unused arch binaries (keep CUDA) ---
-ARG BASE_IMAGE=ghcr.io/googlecloudplatform/scion/scion-claude:latest
-FROM ${BASE_IMAGE} AS qmd-builder
-ARG TARGETARCH
-USER root
-RUN npm install -g @tobilu/qmd && \
-    rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/win-* \
-           /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/mac-* && \
-    if [ "${TARGETARCH}" = "arm64" ]; then \
-        rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-x64*; \
-    else \
-        rm -rf /usr/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-arm*; \
-    fi
-
-# --- Final stage ---
-ARG BASE_IMAGE=ghcr.io/googlecloudplatform/scion/scion-claude:latest
+# Empiria capability image for SCION agents
+# Extends scion-claude with qmd, ctx7, uv, gh, ripgrep
+ARG BASE_IMAGE=scion-claude:latest
 FROM ${BASE_IMAGE}
 ARG TARGETARCH
 USER root
@@ -37,34 +24,37 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-# qmd: copy stripped package from builder stage
-COPY --from=qmd-builder /usr/lib/node_modules/@tobilu/qmd \
-     /usr/lib/node_modules/@tobilu/qmd
-RUN ln -s ../lib/node_modules/@tobilu/qmd/dist/qmd.js /usr/bin/qmd
+# qmd: semantic vault search (install + strip unused platform binaries)
+RUN npm install -g @tobilu/qmd && \
+    NPM_PREFIX=$(npm prefix -g) && \
+    rm -rf "$NPM_PREFIX/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/win-"* \
+           "$NPM_PREFIX/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/mac-"* && \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        rm -rf "$NPM_PREFIX/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-x64"*; \
+    else \
+        rm -rf "$NPM_PREFIX/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-arm"*; \
+    fi
 
 # ctx7: library documentation lookup
 RUN npm install -g ctx7
 
-USER agent
+# Switch to scion user (defined by scion-claude base image)
+USER scion
 
 # Pre-create qmd cache dir so volume mounts don't make it root-owned
 RUN mkdir -p ~/.cache/qmd
 
 # uv + Python: managed environment
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/home/agent/.local/bin:$PATH"
+ENV PATH="/home/scion/.local/bin:$PATH"
 RUN uv python install 3.13
-RUN uv venv /home/agent/.venv
-ENV VIRTUAL_ENV="/home/agent/.venv"
-ENV PATH="/home/agent/.venv/bin:$PATH"
+RUN uv venv /home/scion/.venv
+ENV VIRTUAL_ENV="/home/scion/.venv"
+ENV PATH="/home/scion/.venv/bin:$PATH"
 
 # rustup: Rust toolchain for cargo dependencies
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-ENV PATH="/home/agent/.cargo/bin:$PATH"
+ENV PATH="/home/scion/.cargo/bin:$PATH"
 
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
-
-ENV SHELL="/bin/bash"
-ENTRYPOINT ["/home/agent/entrypoint.sh"]
-CMD ["bash"]
