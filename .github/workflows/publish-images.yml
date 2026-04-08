@@ -101,7 +101,7 @@ jobs:
   # --- SCION base images (built via SCION's reusable workflow) ---
 
   scion-base-images:
-    uses: google/scion/.github/workflows/build-images.yml@main
+    uses: GoogleCloudPlatform/scion/.github/workflows/build-images.yml@main
     with:
       registry: ghcr.io/empiria
       target: common
