@@ -98,9 +98,23 @@ jobs:
           cache-from: type=gha,scope=mnemosyne-claude
           cache-to: type=gha,mode=max,scope=mnemosyne-claude
 
+  # --- SCION base images (built via SCION's reusable workflow) ---
+
+  scion-base-images:
+    uses: google/scion/.github/workflows/build-images.yml@main
+    with:
+      registry: ghcr.io/empiria
+      target: common
+      tag: latest
+      platform: linux/amd64
+    permissions:
+      contents: read
+      packages: write
+
   # --- SCION capability images ---
 
   empiria-claude:
+    needs: scion-base-images
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -137,7 +151,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=ghcr.io/googlecloudplatform/scion/scion-claude:latest
+            BASE_IMAGE=${{ env.REGISTRY }}/${{ env.ORG }}/scion-claude:latest
           cache-from: type=gha,scope=empiria-claude
           cache-to: type=gha,mode=max,scope=empiria-claude
 
