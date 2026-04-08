@@ -1,50 +1,109 @@
-# Mnemosyne Agent Containers
+# Container Images
 
-Podman container images for running autonomous Claude Code agents with `--dangerously-skip-permissions`. The container IS the safety boundary.
+Container images for running autonomous Claude Code agents. Two image families exist: SCION capability images (recommended) and legacy Podman images (deprecated).
 
-## Images
+## Image Hierarchy
 
-| Image | Containerfile | Purpose |
-|-------|---------------|---------|
-| `mnemosyne-base` | `base/Containerfile` | Debian bookworm-slim with Node 22, git, Starship, hapi |
-| `mnemosyne-claude` | `claude/Containerfile` | Extends base: adds gh, ripgrep, uv, Claude Code, qmd, ctx7 |
-| `mnemosyne-hapi-hub` | `hapi-hub/Containerfile` | Standalone hapi relay hub for mobile access |
+```
+scion-claude (Google — SCION base)
+  └── empiria-claude (Empiria base: qmd, ctx7, uv, gh, ripgrep, mnemosyne-cli)
+        └── empiria-claude-anvil (Anvil: Playwright, pytest-playwright)
+
+mnemosyne-base (legacy — Debian bookworm-slim, Node 22, git, hapi)
+  └── mnemosyne-claude (legacy — extends base: gh, ripgrep, uv, Claude Code, qmd, ctx7)
+```
 
 ## Getting Images
 
-Pre-built images are published to `ghcr.io/empiria` on every push to main. Pull them with:
+Pre-built images are published to `ghcr.io/empiria/` on every push to `containers/` on main.
 
-```sh
+```bash
+# SCION images (recommended)
+podman pull ghcr.io/empiria/empiria-claude:latest
+podman pull ghcr.io/empiria/empiria-claude-anvil:latest
+
+# Legacy images (deprecated — for mnemosyne agent start)
+podman pull ghcr.io/empiria/mnemosyne-base:latest
+podman pull ghcr.io/empiria/mnemosyne-claude:latest
+```
+
+Or use the CLI shortcut for legacy images:
+
+```bash
 mnemosyne refresh
 ```
 
-This pulls both `mnemosyne-base` and `mnemosyne-claude` from the registry and tags them as `localhost/` for local use.
-
-### Building locally
+## Building Locally
 
 For contributors modifying Containerfiles:
 
-```sh
+### SCION capability images
+
+```bash
+# empiria-claude (from scion-claude base)
+podman build -t empiria-claude:latest containers/empiria-claude/
+
+# empiria-claude-anvil (from empiria-claude)
+podman build -t empiria-claude-anvil:latest \
+  --build-arg BASE_IMAGE=localhost/empiria-claude:latest \
+  containers/empiria-claude-anvil/
+```
+
+### Legacy images
+
+```bash
+podman build --platform linux/amd64 -t mnemosyne-base containers/base/
+podman build --platform linux/amd64 -t mnemosyne-claude containers/claude/
+```
+
+Or via the CLI:
+
+```bash
 mnemosyne refresh --build
 ```
 
-Or manually, in order (base first, then dependent images):
+## SCION Setup
 
-```sh
-podman build --platform linux/amd64 -t mnemosyne-base containers/base/
-podman build --platform linux/amd64 -t mnemosyne-claude containers/claude/
-podman build --platform linux/amd64 -t mnemosyne-hapi-hub containers/hapi-hub/
-```
+To use these images with SCION:
 
-The `claude/Containerfile` accepts a `BASE_IMAGE` build-arg (defaults to `localhost/mnemosyne-base:latest`). CI overrides this to `ghcr.io/empiria/mnemosyne-base:latest`.
+1. **Install SCION** — follow the [SCION installation docs](https://googlecloudplatform.github.io/scion/overview/)
 
-## Running
+2. **Use the Empiria template** — the shared template at `agents/scion-template/` in the Mnemosyne vault configures vault access, qmd search, and mnemosyne CLI:
 
-The preferred way to launch an agent session is `mnemosyne agent start <project>`. The commands below are for reference or debugging.
+   ```bash
+   scion start my-agent "implement feature X" \
+     --template /path/to/mnemosyne/agents/scion-template \
+     --image ghcr.io/empiria/empiria-claude:latest
+   ```
+
+   For Anvil projects:
+
+   ```bash
+   scion start my-agent "fix form validation" \
+     --template /path/to/mnemosyne/agents/scion-template \
+     --image ghcr.io/empiria/empiria-claude-anvil:latest
+   ```
+
+3. **Configure a SCION profile** (optional — avoids repeating flags):
+
+   ```bash
+   scion profile create empiria \
+     --template empiria-agent \
+     --harness-config claude \
+     --runtime podman
+
+   scion profile use empiria
+   ```
+
+See `docs/how-to/scion-migration.md` in the vault for the full migration guide.
+
+## Running (Legacy)
+
+The preferred legacy method is `mnemosyne agent start <project>`. These commands are deprecated — use SCION instead. See below for reference.
 
 ### Claude agent
 
-```sh
+```bash
 PROJECT_DIR=/path/to/project
 podman run -it --rm \
   -v $PROJECT_DIR:$PROJECT_DIR \
@@ -61,7 +120,7 @@ podman run -it --rm \
 
 ### hapi hub (for mobile relay)
 
-```sh
+```bash
 podman run -d --rm \
   -p 3006:3006 \
   -e HAPI_MODE=relay \
@@ -71,25 +130,23 @@ podman run -d --rm \
 
 ## Configuration
 
-### /config mount
+### /config mount (legacy)
 
 Mount `containers/config/` at `/config` inside the container. The entrypoint merges:
 
 - `/config/.claude/` -> `~/.claude/` (symlinks, non-destructive — existing files are not overwritten)
 - `/config/zellij/` -> `~/.config/zellij/` (copied, for non-Claude containers that use Zellij)
 
-This allows shared agent config (MCP servers, commands, rules) without baking it into the image.
-
 ### Volume mounts
 
 | Host path | Container path | Mode | Purpose |
 |-----------|---------------|------|---------|
 | `/path/to/project` | `/path/to/project` | rw | Project repository (mounted at host path) |
-| `$MNEMOSYNE_VAULT` | `/vault` | ro | Mnemosyne knowledge vault |
-| `containers/config` | `/config` | ro | Shared agent config |
-| `$SSH_AUTH_SOCK` | `/tmp/ssh-auth-sock` | rw | SSH agent for git auth |
+| `$MNEMOSYNE_VAULT` | `/vault` | rw | Mnemosyne knowledge vault |
+| `containers/config` | `/config` | ro | Shared agent config (legacy) |
+| `$SSH_AUTH_SOCK` | `/run/ssh-agent` | rw | SSH agent for git auth |
 
-### Project dependencies
+### Project dependencies (legacy)
 
 Project-specific tools and packages are declared in a `container.toml` file in the project's vault directory (e.g. `projects/<org>/<slug>/container.toml`). The entrypoint installs these at startup.
 
@@ -106,52 +163,41 @@ packages = ["pytest-playwright"]
 commands = ["playwright install chromium"]
 ```
 
-See `projects/<org>/<slug>/container.toml` in the Mnemosyne vault for project-specific declarations.
+**Note:** SCION capability images replace `container.toml` — deps are baked into the image (e.g. `empiria-claude-anvil` includes Playwright). No runtime installation needed.
 
 ## Authentication
 
-### Claude Code (OAuth)
+### Claude Code
 
-Claude Code authenticates via OAuth subscription token, not an API key.
-
-1. Authenticate on the host: `claude auth login`
-2. Find the token: `cat ~/.claude/.credentials.json`
-3. Pass as env var: `-e CLAUDE_CODE_OAUTH_TOKEN="<token>"`
-
-The entrypoint writes `~/.claude.json` with `hasCompletedOnboarding: true` automatically when the token is present, bypassing the interactive setup.
+- **SCION:** Auth is handled automatically by SCION's Claude harness — no manual credential management
+- **Legacy:** Pass `CLAUDE_CODE_OAUTH_TOKEN` env var or mount credentials JSON
 
 ### GitHub CLI
 
-The `gh` CLI authenticates via the `GH_TOKEN` environment variable. Add it to `~/.config/mnemosyne/agent.env`:
+The `gh` CLI authenticates via the `GH_TOKEN` environment variable.
 
-```
-GH_TOKEN=ghp_xxxxxxxxxxxx
-```
-
-`mnemosyne agent start` passes it into the container automatically. Create a token at https://github.com/settings/tokens (classic with `repo` scope, or fine-grained).
+- **SCION:** Configured as a secret in `scion-agent.yaml` — SCION prompts for it if not set
+- **Legacy:** Add to `~/.config/mnemosyne/agent.env`, passed automatically by `mnemosyne agent start`
 
 ### SSH agent forwarding
 
 Pass the host SSH agent socket to avoid storing keys inside the container:
 
-```sh
--v $SSH_AUTH_SOCK:/tmp/ssh-auth-sock -e SSH_AUTH_SOCK=/tmp/ssh-auth-sock
-```
-
-The entrypoint creates a stable symlink at `~/.ssh-auth-sock` so the socket path remains constant across container restarts.
-
-### Remote control (Claude containers)
-
-Claude containers run `claude remote-control` as their main process. This makes the session available from claude.ai/code or the Claude mobile app — no WireGuard or port forwarding needed.
-
-Get the session URL:
-
 ```bash
-mnemosyne agent remote [project]
+-v $SSH_AUTH_SOCK:/run/ssh-agent -e SSH_AUTH_SOCK=/run/ssh-agent
 ```
 
-Add `--qr` for a QR code to scan from your phone. Each remote session creates its own git worktree automatically.
+The SCION template configures this automatically via `scion-agent.yaml`.
 
-### hapi mobile relay
+## CI Pipeline
 
-For non-Claude agent containers (e.g. opencode), set `CLI_API_TOKEN` to enable the hapi relay. The entrypoint starts hapi automatically when this variable is present. Claude containers use Claude's built-in remote control instead — see [Remote control](#remote-control-claude-containers) above.
+The GitHub Actions workflow (`.github/workflows/publish-images.yml`) builds all four images on push to `containers/` on main:
+
+| Job | Image | Depends on | Platform |
+|-----|-------|-----------|----------|
+| `legacy-base` | `mnemosyne-base` | — | amd64, arm64 |
+| `legacy-claude` | `mnemosyne-claude` | `legacy-base` | amd64, arm64 |
+| `empiria-claude` | `empiria-claude` | — | amd64 |
+| `empiria-claude-anvil` | `empiria-claude-anvil` | `empiria-claude` | amd64 |
+
+Manual dispatch is also available via `workflow_dispatch`.

@@ -3,6 +3,8 @@ name: Publish container images
 on:
   push:
     branches: [main]
+    paths:
+      - 'containers/**'
   workflow_dispatch:
 
 env:
@@ -10,7 +12,9 @@ env:
   ORG: empiria
 
 jobs:
-  publish:
+  # --- Legacy images (D-10 backward compat) ---
+
+  legacy-base:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -25,14 +29,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Extract metadata for mnemosyne-base
-        id: base-meta
+        id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.ORG }}/mnemosyne-base
@@ -47,15 +48,34 @@ jobs:
           file: containers/base/Containerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.base-meta.outputs.tags }}
-          labels: ${{ steps.base-meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             MNEMOSYNE_BUILD_HASH=${{ github.sha }}
           cache-from: type=gha,scope=mnemosyne-base
           cache-to: type=gha,mode=max,scope=mnemosyne-base
 
+  legacy-claude:
+    needs: legacy-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Extract metadata for mnemosyne-claude
-        id: claude-meta
+        id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.ORG }}/mnemosyne-claude
@@ -70,10 +90,95 @@ jobs:
           file: containers/claude/Containerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.claude-meta.outputs.tags }}
-          labels: ${{ steps.claude-meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             MNEMOSYNE_BUILD_HASH=${{ github.sha }}
             BASE_IMAGE=ghcr.io/${{ env.ORG }}/mnemosyne-base:latest
           cache-from: type=gha,scope=mnemosyne-claude
           cache-to: type=gha,mode=max,scope=mnemosyne-claude
+
+  # --- SCION capability images ---
+
+  empiria-claude:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata for empiria-claude
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.ORG }}/empiria-claude
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push empiria-claude
+        uses: docker/build-push-action@v6
+        with:
+          context: containers/empiria-claude
+          file: containers/empiria-claude/Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_IMAGE=ghcr.io/googlecloudplatform/scion/scion-claude:latest
+          cache-from: type=gha,scope=empiria-claude
+          cache-to: type=gha,mode=max,scope=empiria-claude
+
+  empiria-claude-anvil:
+    needs: empiria-claude
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata for empiria-claude-anvil
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.ORG }}/empiria-claude-anvil
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push empiria-claude-anvil
+        uses: docker/build-push-action@v6
+        with:
+          context: containers/empiria-claude-anvil
+          file: containers/empiria-claude-anvil/Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ env.ORG }}/empiria-claude:latest
+          cache-from: type=gha,scope=empiria-claude-anvil
+          cache-to: type=gha,mode=max,scope=empiria-claude-anvil
