@@ -38,7 +38,7 @@ RUN npm install -g @tobilu/qmd && \
 # ctx7: library documentation lookup
 RUN npm install -g ctx7
 
-# Switch to scion user (defined by scion-claude base image)
+# Switch to scion user for installing user-level tools
 USER scion
 
 # Pre-create qmd cache dir so volume mounts don't make it root-owned
@@ -58,3 +58,6 @@ ENV PATH="/home/scion/.cargo/bin:$PATH"
 
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
+
+# Run as root so sciontool init can fix volume ownership before dropping privileges
+USER root

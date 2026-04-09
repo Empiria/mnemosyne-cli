@@ -12,3 +12,6 @@ USER scion
 ENV PATH="/home/scion/.local/bin:/home/scion/.venv/bin:$PATH"
 RUN uv pip install pytest-playwright && \
     playwright install chromium
+
+# Run as root so sciontool init can fix volume ownership before dropping privileges
+USER root
