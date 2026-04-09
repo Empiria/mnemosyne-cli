@@ -12,3 +12,6 @@ USER scion
 ENV PATH="/home/scion/.local/bin:/home/scion/.venv/bin:$PATH"
 RUN uv pip install pytest-playwright && \
     playwright install chromium
+
+# Inherit USER root from base image (see empiria-claude Containerfile)
+USER root
