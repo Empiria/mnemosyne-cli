@@ -3,17 +3,21 @@
 Each subagent type maps to a model (opus/sonnet/haiku) based on the active
 profile.  Profiles are stored per-project in .planning/config.json under
 ``model_profile``.  Per-agent overrides live under ``model_overrides``.
+A machine-wide default profile can be set in ~/.config/mnemosyne/config.toml.
 
 Resolution priority:
 1. model_overrides[agent_type] in .planning/config.json
-2. MODEL_PROFILES[agent_type][profile]
-3. "sonnet" (fallback)
+2. model_profile in .planning/config.json
+3. model_profile in ~/.config/mnemosyne/config.toml
+4. "balanced" (hardcoded fallback)
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from mnemosyne_cli.lib import vault
 
 # ---------------------------------------------------------------------------
 # Profile table
@@ -82,10 +86,29 @@ def _write_planning_config(planning_dir: Path, data: dict) -> None:
     config_path.write_text(json.dumps(data, indent=2) + "\n")
 
 
+def get_global_profile() -> str | None:
+    """Return the machine-wide model profile from config.toml, or None."""
+    cfg = vault._read_config()
+    return cfg.get("model_profile")
+
+
+def set_global_profile(profile: str) -> None:
+    """Set the machine-wide default model profile in config.toml."""
+    cfg = vault._read_config()
+    cfg["model_profile"] = profile
+    vault._write_config(cfg)
+
+
 def get_profile(planning_dir: Path) -> str:
-    """Return the active model profile name."""
+    """Return the active model profile name.
+
+    Resolution: project config → global config → "balanced".
+    """
     cfg = _read_planning_config(planning_dir)
-    return cfg.get("model_profile", DEFAULT_PROFILE)
+    project_profile = cfg.get("model_profile")
+    if project_profile:
+        return project_profile
+    return get_global_profile() or DEFAULT_PROFILE
 
 
 def set_profile(planning_dir: Path, profile: str) -> None:
@@ -130,9 +153,10 @@ def resolve_model(agent_type: str, planning_dir: Path) -> str:
     """Resolve the model for an agent type given project config.
 
     Priority:
-    1. model_overrides[agent_type] in config.json
-    2. MODEL_PROFILES[agent_type][profile]
-    3. "sonnet" (fallback for unknown agent types)
+    1. model_overrides[agent_type] in .planning/config.json
+    2. model_profile in .planning/config.json
+    3. model_profile in ~/.config/mnemosyne/config.toml
+    4. "balanced" profile (hardcoded fallback)
     """
     cfg = _read_planning_config(planning_dir)
 
@@ -141,8 +165,8 @@ def resolve_model(agent_type: str, planning_dir: Path) -> str:
     if override:
         return override
 
-    # 2. Profile lookup
-    profile = cfg.get("model_profile", DEFAULT_PROFILE)
+    # 2-3. Profile lookup (project → global → default)
+    profile = get_profile(planning_dir)
     if profile == "inherit":
         return "inherit"
 

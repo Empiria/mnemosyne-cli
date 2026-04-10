@@ -14,10 +14,12 @@ from mnemosyne_cli.lib.models import (
     VALID_MODELS,
     VALID_PROFILES,
     clear_override,
+    get_global_profile,
     get_overrides,
     get_profile,
     resolve_all,
     resolve_model,
+    set_global_profile,
     set_override,
     set_profile,
 )
@@ -59,16 +61,47 @@ def resolve(
 @app.command("profile")
 def profile_cmd(
     name: str = typer.Argument(None, help="Profile to activate (quality/balanced/budget/inherit)."),
+    global_: bool = typer.Option(False, "--global", help="Set/show the machine-wide default instead of per-project."),
 ) -> None:
     """Show or set the active model profile.
 
-    Without arguments, shows the current profile.  With a profile name, switches to it.
+    Without arguments, shows the current profile (and its source).
+    With a profile name, switches to it.
+    Use --global to set the machine-wide default in ~/.config/mnemosyne/config.toml.
     """
+    if global_:
+        if name is None:
+            current = get_global_profile()
+            if current:
+                console.print(f"Global default profile: [bold]{current}[/bold]")
+            else:
+                console.print(f"No global default set (falls back to [bold]{DEFAULT_PROFILE}[/bold])")
+            return
+
+        if name not in VALID_PROFILES:
+            error_console.print(f"Unknown profile: {name}")
+            error_console.print(f"Valid profiles: {', '.join(VALID_PROFILES)}")
+            raise typer.Exit(1)
+
+        set_global_profile(name)
+        console.print(f"Global default profile set to [bold]{name}[/bold]")
+        return
+
     planning = _find_planning_dir()
 
     if name is None:
-        current = get_profile(planning)
-        console.print(f"Active profile: [bold]{current}[/bold]")
+        from mnemosyne_cli.lib.models import _read_planning_config
+        cfg = _read_planning_config(planning)
+        project_profile = cfg.get("model_profile")
+        global_profile = get_global_profile()
+        effective = get_profile(planning)
+
+        if project_profile:
+            console.print(f"Active profile: [bold]{effective}[/bold] (project)")
+        elif global_profile:
+            console.print(f"Active profile: [bold]{effective}[/bold] (global default)")
+        else:
+            console.print(f"Active profile: [bold]{effective}[/bold] (hardcoded default)")
         return
 
     if name not in VALID_PROFILES:
@@ -77,7 +110,7 @@ def profile_cmd(
         raise typer.Exit(1)
 
     set_profile(planning, name)
-    console.print(f"Profile set to [bold]{name}[/bold]")
+    console.print(f"Profile set to [bold]{name}[/bold] (project)")
 
     # Show the resulting mappings
     _print_resolution_table(planning)
