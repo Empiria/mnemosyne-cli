@@ -52,6 +52,9 @@ RUN uv venv /home/scion/.venv
 ENV VIRTUAL_ENV="/home/scion/.venv"
 ENV PATH="/home/scion/.venv/bin:$PATH"
 
+# mnemosyne CLI: vault operational commands
+RUN uv pip install git+https://github.com/Empiria/mnemosyne-cli.git
+
 # rustup: Rust toolchain for cargo dependencies
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
 ENV PATH="/home/scion/.cargo/bin:$PATH"
