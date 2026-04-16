@@ -29,6 +29,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -71,6 +74,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -100,9 +106,9 @@ jobs:
 
   # --- SCION capability images ---
   # SCION base images (scion-claude etc.) are pre-built in ghcr.io/empiria/.
-  # To rebuild them, run the SCION build script manually:
-  #   gh repo clone GoogleCloudPlatform/scion && cd scion
-  #   image-build/scripts/build-images.sh --registry ghcr.io/empiria --target all --platform linux/amd64 --push
+  # To rebuild them, trigger the build-images workflow on the Empiria fork:
+  #   gh workflow run build-images.yml --repo Empiria/scion \
+  #     -f registry=ghcr.io/empiria -f target=common -f tag=latest -f platform=all
 
   empiria-claude:
     runs-on: ubuntu-latest
@@ -118,6 +124,9 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -136,7 +145,7 @@ jobs:
         with:
           context: containers/empiria-claude
           file: containers/empiria-claude/Containerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -161,6 +170,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -178,7 +190,7 @@ jobs:
         with:
           context: containers/empiria-claude-anvil
           file: containers/empiria-claude-anvil/Containerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
