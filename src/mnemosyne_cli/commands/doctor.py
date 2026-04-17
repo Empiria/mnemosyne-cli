@@ -954,7 +954,62 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
         )
     )
 
+    # --- Category: Components (mnemosyne project only) ---
+
+    if _components_apply_here(cwd, vault_path):
+        from mnemosyne_cli.commands.component import _read_declared_components
+        from mnemosyne_cli.lib.components import (
+            ComponentNotCloned,
+            ComponentNotConfigured,
+            resolve_component_path,
+        )
+
+        declared = _read_declared_components(vault_path, "projects/empiria/mnemosyne")
+
+        for component_name in [c for c in declared if c != "mnemosyne"]:
+            def _make_check(name: str) -> Callable[[], CheckResult]:
+                def _check() -> CheckResult:
+                    try:
+                        path = resolve_component_path(name)
+                        return CheckResult(
+                            ok=True,
+                            message=f"{name} configured at {path}",
+                        )
+                    except ComponentNotConfigured:
+                        return CheckResult(
+                            ok=False,
+                            message=f"{name} not configured in ~/.config/mnemosyne/config.toml",
+                            fix_cmd=(
+                                f'echo "[components.{name}]\\nlocal_path = '
+                                f'\\"~/projects/<org>/{name}\\"" '
+                                f">> ~/.config/mnemosyne/config.toml"
+                            ),
+                        )
+                    except ComponentNotCloned as exc:
+                        return CheckResult(
+                            ok=False,
+                            message=f"{name} configured at {exc.path} but not cloned",
+                            fix_cmd=f"git clone <repo-url> {exc.path}",
+                        )
+                return _check
+
+            checks.append(Check(
+                name=f"Component: {component_name}",
+                category="Components",
+                _check_fn=_make_check(component_name),
+            ))
+
     return checks
+
+
+def _components_apply_here(cwd: Path, vault_path: Path) -> bool:
+    """True when the resolved project is projects/empiria/mnemosyne.
+
+    Module-level for testability; consumed by the Components check category in
+    `_build_checks`.
+    """
+    rel = lib_vault.resolve_vault_project(cwd, vault_path)
+    return rel == "projects/empiria/mnemosyne"
 
 
 def run(
