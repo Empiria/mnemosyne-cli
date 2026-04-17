@@ -18,7 +18,14 @@ from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.embeds import read_embed_targets
-from mnemosyne_cli.lib.symlinks import CheckResult, discover_agent_commands
+from mnemosyne_cli.lib.symlinks import (
+    CheckResult,
+    SKILLS_YAML_FILENAME,
+    parse_skills_list,
+    expand_skill_names,
+    create_skill_symlink,
+    check_skill_symlink,
+)
 from mnemosyne_cli.lib.techstack import discover_tech_rules, parse_tech_stack
 
 console = Console()
@@ -288,50 +295,184 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                             )
                         )
 
-            # .claude/commands — check per-file symlinks derived from embed notes
-            commands_embed_dir = claude_config / "commands"
-            if commands_embed_dir.is_dir():
-                commands_targets = read_embed_targets(commands_embed_dir)
-                client_commands = cwd / ".claude" / "commands"
+            # --- Category: Skills (.claude/skills/<name> directory symlinks) ---
 
-                # Detect stale directory symlink from pre-Phase-10 setup
-                if client_commands.is_symlink() and commands_targets:
-                    def _check_stale_commands_symlink(_path: Path = client_commands) -> CheckResult:
-                        if _path.is_symlink():
-                            return CheckResult(
-                                ok=False,
-                                message=".claude/commands is a directory symlink (pre-Phase-10 setup) — needs migration to per-file symlinks",
-                                fix_cmd="rm .claude/commands && mkdir -p .claude/commands && mnemosyne doctor --fix",
-                            )
-                        return CheckResult(ok=True, message=".claude/commands is a real directory (migration done)")
+            skills_yaml = claude_config / SKILLS_YAML_FILENAME
+            legacy_commands_dir = claude_config / "commands"
+            client_commands_dir = cwd / ".claude" / "commands"
 
-                    def _fix_stale_commands_symlink(_path: Path = client_commands) -> None:
-                        _path.unlink()
-                        _path.mkdir(parents=True, exist_ok=True)
+            def _is_legacy_layout() -> bool:
+                """Detect projects still using .claude/commands/*.md file symlinks."""
+                if not legacy_commands_dir.is_dir():
+                    return False
+                targets = read_embed_targets(legacy_commands_dir)
+                if not targets:
+                    return False
+                if not client_commands_dir.exists() and not client_commands_dir.is_symlink():
+                    return False
+                # Check for any .md file symlinks in .claude/commands/
+                if client_commands_dir.is_dir() and not client_commands_dir.is_symlink():
+                    for f in client_commands_dir.iterdir():
+                        if f.suffix == ".md" and f.is_symlink():
+                            return True
+                return False
 
+            if _is_legacy_layout():
+                # Scenario A — legacy layout: single check that reports failure and
+                # offers a 7-step atomic migration as the fix.
+
+                def _check_legacy_layout(
+                    _is_legacy: Callable[[], bool] = _is_legacy_layout,
+                ) -> CheckResult:
+                    # Re-evaluate dynamically so the re-check after --fix succeeds.
+                    if _is_legacy():
+                        return CheckResult(
+                            ok=False,
+                            message=(
+                                "Legacy .claude/commands/*.md file symlinks detected — "
+                                "run mnemosyne doctor --fix to migrate to .claude/skills/ layout"
+                            ),
+                            fix_cmd="mnemosyne doctor --fix",
+                        )
+                    return CheckResult(
+                        ok=True,
+                        message="Migration complete — .claude/skills/ layout in place",
+                    )
+
+                def _fix_legacy_layout(
+                    _cwd: Path = cwd,
+                    _vault_path: Path = vault_path,
+                    _legacy_commands_dir: Path = legacy_commands_dir,
+                    _client_commands_dir: Path = client_commands_dir,
+                    _git_dir: Path = git_dir,
+                ) -> None:
+                    """7-step atomic migration from legacy .claude/commands layout."""
+                    # Step 1: Parse legacy embed notes → collect skill names
+                    legacy_targets = read_embed_targets(_legacy_commands_dir)
+                    # Strip .md suffix from filenames to get skill names
+                    skill_names_raw = [
+                        fname[:-3] if fname.endswith(".md") else fname
+                        for fname in legacy_targets
+                    ]
+
+                    # Step 2: Write claude-config/skills.yaml BEFORE any deletions
+                    skills_yaml_path = _legacy_commands_dir.parent / SKILLS_YAML_FILENAME
+                    tmp_path_yaml = skills_yaml_path.with_suffix(".yaml.tmp")
+                    lines = ["skills:\n"] + [f"  - {name}\n" for name in skill_names_raw]
+                    tmp_path_yaml.write_text("".join(lines), encoding="utf-8")
+                    tmp_path_yaml.rename(skills_yaml_path)
+
+                    # Step 3: Delete legacy .claude/commands/*.md file symlinks in project
+                    if _client_commands_dir.is_dir() and not _client_commands_dir.is_symlink():
+                        for f in list(_client_commands_dir.iterdir()):
+                            if f.suffix == ".md" and f.is_symlink():
+                                f.unlink()
+
+                    # Step 4: Create new .claude/skills/<name>/ directory symlinks
+                    expanded_names = expand_skill_names(skill_names_raw, _vault_path)
+                    for name in expanded_names:
+                        create_skill_symlink(_cwd, name, _vault_path)
+
+                    # Step 5: Delete legacy embed note files and claude-config/commands/ dir
+                    # Remove the embed .md files that were the source of truth before skills.yaml
+                    if _legacy_commands_dir.is_dir():
+                        for f in list(_legacy_commands_dir.iterdir()):
+                            if f.suffix == ".md" and f.is_file():
+                                f.unlink()
+                    try:
+                        _legacy_commands_dir.rmdir()
+                    except OSError:
+                        console.print(
+                            f"    [yellow]Warning[/yellow]: {_legacy_commands_dir} is not empty — "
+                            "leaving it in place. Remove manually after reviewing contents."
+                        )
+
+                    # Step 6: Update .git/info/exclude — add .claude/skills, remove .claude/commands
+                    lib_git.add_git_exclusion(".claude/skills", _git_dir)
+                    exclude_file = _git_dir / "info" / "exclude"
+                    if exclude_file.exists():
+                        lines_ex = exclude_file.read_text().splitlines()
+                        filtered = [ln for ln in lines_ex if ln.strip() != ".claude/commands"]
+                        exclude_file.write_text("\n".join(filtered) + ("\n" if filtered else ""))
+
+                    # Step 7: Commit vault-side changes (skills.yaml + commands/ removal)
+                    vault_git_dir = _vault_path  # pass vault root for git -C
+                    # Determine the vault-relative path for the claude-config dir
+                    try:
+                        rel_config = str(
+                            (_legacy_commands_dir.parent).relative_to(_vault_path)
+                        )
+                    except ValueError:
+                        rel_config = str(_legacy_commands_dir.parent)
+                    # Derive project name for commit message
+                    project_rel = lib_vault.resolve_vault_project(_cwd, _vault_path) or rel_config
+                    project_name = project_rel.split("/")[-1]
+                    import subprocess as _sp
+                    _sp.run(
+                        ["git", "-C", str(vault_git_dir), "add", rel_config],
+                        check=True,
+                    )
+                    _sp.run(
+                        ["git", "-C", str(vault_git_dir), "commit",
+                         "-m", f"♻️ {project_name}: migrate claude-config/commands/ → skills.yaml"],
+                        check=True,
+                    )
+
+                checks.append(
+                    Check(
+                        name=".claude/skills layout (legacy project — migration needed)",
+                        category="Skills",
+                        _check_fn=_check_legacy_layout,
+                        _fix_fn=_fix_legacy_layout,
+                        fix_description=(
+                            "Migrate .claude/commands/*.md → skills.yaml + .claude/skills/<name>/ "
+                            "(7-step atomic migration)"
+                        ),
+                    )
+                )
+
+            elif skills_yaml.exists():
+                # Scenario B — new layout: one check per skill in skills.yaml
+                try:
+                    raw_names = parse_skills_list(skills_yaml)
+                    skill_names = expand_skill_names(raw_names, vault_path)
+                except ValueError as exc:
                     checks.append(
                         Check(
-                            name=".claude/commands directory migration",
-                            category="Symlinks",
-                            _check_fn=_check_stale_commands_symlink,
-                            _fix_fn=_fix_stale_commands_symlink,
-                            fix_description="Remove stale directory symlink and create real directory",
+                            name="skills.yaml parseable",
+                            category="Skills",
+                            _check_fn=lambda _e=exc: CheckResult(
+                                ok=False,
+                                message=f"skills.yaml error: {_e}",
+                                fix_cmd=None,
+                            ),
                         )
                     )
-                    # Skip per-file checks when stale directory symlink is present
-                else:
-                    for filename, target_rel in commands_targets.items():
-                        target_abs = vault_path / target_rel
-                        link_path = f".claude/commands/{filename}"
-                        checks.append(
-                            Check(
-                                name=f".claude/commands/{filename} symlink",
-                                category="Symlinks",
-                                _check_fn=_perfile_symlink_check(link_path, target_abs),
-                                _fix_fn=_perfile_symlink_fix(link_path, target_abs),
-                                fix_description=f"Create {link_path} -> {target_rel}",
-                            )
+                    skill_names = []
+
+                for name in skill_names:
+                    checks.append(
+                        Check(
+                            name=f".claude/skills/{name} symlink",
+                            category="Skills",
+                            _check_fn=lambda _n=name: check_skill_symlink(cwd, _n, vault_path),
+                            _fix_fn=lambda _n=name: create_skill_symlink(cwd, _n, vault_path),
+                            fix_description=f"Create .claude/skills/{name}/ -> agents/skills/{name}/",
                         )
+                    )
+
+            else:
+                # Scenario C — neither skills.yaml nor legacy commands exist
+                checks.append(
+                    Check(
+                        name="skills.yaml not configured",
+                        category="Skills",
+                        _check_fn=lambda: CheckResult(
+                            ok=True,
+                            message="No skills.yaml in claude-config/ (no skills configured for this project)",
+                        ),
+                    )
+                )
 
             # Tech stack auto-rules — derived from AGENTS.md Tech stack: line
             agents_target = vault_project_path / "AGENTS.md"
@@ -361,20 +502,6 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                         _check_fn=_symlink_check(".claude/settings.json", settings_src),
                         _fix_fn=_symlink_fix(".claude/settings.json", settings_src),
                         fix_description=f"Create .claude/settings.json -> {settings_src}",
-                    )
-                )
-
-            # Vault-wide agent commands — auto-linked for all supported tools
-            agent_commands = discover_agent_commands(vault_path)
-            for cmd in agent_commands:
-                link_path = f"{cmd.tool_dir}/{cmd.agent_name}.md"
-                checks.append(
-                    Check(
-                        name=f"{link_path} symlink",
-                        category="Agent Commands",
-                        _check_fn=_perfile_symlink_check(link_path, cmd.target),
-                        _fix_fn=_perfile_symlink_fix(link_path, cmd.target),
-                        fix_description=f"Create {link_path} -> {cmd.target.relative_to(vault_path)}",
                     )
                 )
         else:
@@ -417,16 +544,10 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
             claude_config = vault_project_path / "claude-config"
             if (claude_config / "rules").is_dir():
                 exclusion_entries.append(".claude/rules")
-            if (claude_config / "commands").is_dir():
-                exclusion_entries.append(".claude/commands")
+            if (claude_config / SKILLS_YAML_FILENAME).exists():
+                exclusion_entries.append(".claude/skills")
             if (claude_config / "settings.json").exists():
                 exclusion_entries.append(".claude/settings.json")
-
-            # Add exclusions for vault-wide agent command directories
-            agent_tool_dirs = {cmd.tool_dir for cmd in discover_agent_commands(vault_path)}
-            for tool_dir in sorted(agent_tool_dirs):
-                if tool_dir not in exclusion_entries:
-                    exclusion_entries.append(tool_dir)
 
         for entry in exclusion_entries:
             checks.append(
