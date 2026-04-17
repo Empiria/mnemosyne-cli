@@ -14,7 +14,12 @@ from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.embeds import read_embed_targets
-from mnemosyne_cli.lib.symlinks import discover_agent_commands
+from mnemosyne_cli.lib.symlinks import (
+    SKILLS_YAML_FILENAME,
+    create_skill_symlink,
+    expand_skill_names,
+    parse_skills_list,
+)
 from mnemosyne_cli.lib.techstack import discover_tech_rules, parse_tech_stack
 
 console = Console()
@@ -124,20 +129,26 @@ def run(
         else:
             console.print("  [yellow]Skipped[/yellow] .claude/rules — no embed targets found")
 
-    # .claude/commands — read embed notes and create per-file symlinks
-    commands_embed_dir = claude_config / "commands"
-    if commands_embed_dir.is_dir():
-        commands_targets = read_embed_targets(commands_embed_dir)
-        if commands_targets:
-            client_commands = claude_dir / "commands"
-            client_commands.mkdir(parents=True, exist_ok=True)
-            for filename, target_rel in commands_targets.items():
-                target_abs = vault_path / target_rel
-                symlink = client_commands / filename
-                if _create(symlink, target_abs, f".claude/commands/{filename} -> {target_rel}"):
-                    created_symlinks.append(f".claude/commands/{filename}")
-        else:
-            console.print("  [yellow]Skipped[/yellow] .claude/commands — no embed targets found")
+    # .claude/skills — read skills.yaml and create per-skill directory symlinks
+    skills_yaml = claude_config / SKILLS_YAML_FILENAME
+    if skills_yaml.exists():
+        try:
+            raw_names = parse_skills_list(skills_yaml)
+            skill_names = expand_skill_names(raw_names, vault_path)
+        except ValueError as exc:
+            error_console.print(f"  [red]Error[/red] skills.yaml: {exc}")
+            errors.append("skills.yaml")
+            skill_names = []
+        for name in skill_names:
+            try:
+                create_skill_symlink(cwd, name, vault_path)
+                console.print(f"  [green]Created[/green] .claude/skills/{name}/ -> agents/skills/{name}/")
+                created_symlinks.append(f".claude/skills/{name}")
+            except Exception as exc:
+                error_console.print(f"  [red]Error[/red] .claude/skills/{name}: {exc}")
+                errors.append(f".claude/skills/{name}")
+    else:
+        console.print("  [yellow]Skipped[/yellow] .claude/skills — no skills.yaml found in claude-config/")
 
     # Tech stack auto-rules — derive from AGENTS.md Tech stack: line
     if agents_target.exists():
@@ -161,17 +172,6 @@ def run(
         if _create(settings_link, settings_src, f".claude/settings.json -> {settings_src}"):
             created_symlinks.append(".claude/settings.json")
 
-    # 8. Vault-wide agent commands — auto-link for all supported tools
-    agent_commands = discover_agent_commands(vault_path)
-    if agent_commands:
-        for cmd in agent_commands:
-            link_dir = cwd / cmd.tool_dir
-            link_dir.mkdir(parents=True, exist_ok=True)
-            symlink = link_dir / f"{cmd.agent_name}.md"
-            display = f"{cmd.tool_dir}/{cmd.agent_name}.md -> {cmd.target.relative_to(vault_path)}"
-            if _create(symlink, cmd.target, display):
-                created_symlinks.append(f"{cmd.tool_dir}/{cmd.agent_name}.md")
-
     # --- Section: Configuring git exclusions ---
     console.rule("[bold cyan]Configuring git exclusions[/bold cyan]")
 
@@ -183,10 +183,8 @@ def run(
     optional_excludes = []
     if any(s.startswith(".claude/rules/") for s in created_symlinks):
         optional_excludes.append(".claude/rules")
-    if any(s.startswith(".claude/commands/") for s in created_symlinks):
-        optional_excludes.append(".claude/commands")
-    if any(s.startswith(".opencode/commands/") for s in created_symlinks):
-        optional_excludes.append(".opencode/commands")
+    if any(s.startswith(".claude/skills/") for s in created_symlinks):
+        optional_excludes.append(".claude/skills")
     if ".claude/settings.json" in created_symlinks:
         optional_excludes.append(".claude/settings.json")
     all_to_exclude = always_exclude + optional_excludes
