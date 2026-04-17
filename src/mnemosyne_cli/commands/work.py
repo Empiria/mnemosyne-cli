@@ -14,6 +14,12 @@ from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.embeds import read_embed_targets
+from mnemosyne_cli.lib.symlinks import (
+    SKILLS_YAML_FILENAME,
+    create_skill_symlink,
+    expand_skill_names,
+    parse_skills_list,
+)
 from mnemosyne_cli.lib.techstack import discover_tech_rules, parse_tech_stack
 
 app = typer.Typer(no_args_is_help=True, help="Manage worktree-based work sessions.")
@@ -138,23 +144,21 @@ def _setup_worktree_symlinks(
                     force=True,
                 )
 
-    # .claude/commands — per-file symlinks from embed notes
-    commands_embed_dir = claude_config / "commands"
-    if commands_embed_dir.is_dir():
-        for filename, target_rel in read_embed_targets(commands_embed_dir).items():
-            lib_symlinks.create_symlink(
-                worktree_path / ".claude" / "commands" / filename,
-                vault_path / target_rel,
-                force=True,
-            )
-
-    # Vault-wide agent commands (e.g. mnemosyne-search, mnemosyne-capture)
-    for cmd in lib_symlinks.discover_agent_commands(vault_path):
-        lib_symlinks.create_symlink(
-            worktree_path / cmd.tool_dir / f"{cmd.agent_name}.md",
-            cmd.target,
-            force=True,
-        )
+    # .claude/skills — directory symlinks from skills.yaml
+    skills_yaml = claude_config / SKILLS_YAML_FILENAME
+    if skills_yaml.exists():
+        try:
+            raw_names = parse_skills_list(skills_yaml)
+            skill_names = expand_skill_names(raw_names, vault_path)
+        except ValueError as exc:
+            error_console.print(f"  [yellow]Warning[/yellow] skills.yaml error: {exc} (skipping skills)")
+            skill_names = []
+        for name in skill_names:
+            try:
+                create_skill_symlink(worktree_path, name, vault_path)
+                console.print(f"  .claude/skills/{name}/ -> agents/skills/{name}/")
+            except Exception as exc:
+                error_console.print(f"  [yellow]Warning[/yellow] .claude/skills/{name}: {exc}")
 
 
 def _ensure_worktree(branch: str) -> Path:
