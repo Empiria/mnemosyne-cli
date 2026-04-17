@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import subprocess
 import sys
 import tomllib
@@ -873,6 +874,15 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                         message=f"{hook_name} hook not installed",
                         fix_cmd=f"mnemosyne doctor --fix",
                     )
+                if hook_path.is_symlink() and not hook_path.exists():
+                    return CheckResult(
+                        ok=False,
+                        message=(
+                            f"{hook_name} hook is a broken symlink "
+                            f"(-> {os.readlink(hook_path)})"
+                        ),
+                        fix_cmd="mnemosyne doctor --fix",
+                    )
                 try:
                     content = hook_path.read_text()
                 except OSError:
@@ -894,6 +904,11 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
             def _fix(_name: str = hook_name) -> None:
                 hook_path = git_dir / "hooks" / _name
                 hook_path.parent.mkdir(parents=True, exist_ok=True)
+                # If the path is an existing symlink (possibly broken) or a stale
+                # file, unlink it first so write_text() doesn't follow the symlink
+                # and try to write through to a non-existent target.
+                if hook_path.is_symlink() or hook_path.is_file():
+                    hook_path.unlink()
                 hook_path.write_text(_hook_script_content)
                 hook_path.chmod(0o755)
             return _fix
