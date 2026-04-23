@@ -5,6 +5,9 @@ USER root
 # Playwright system dependencies for browser testing
 RUN npx playwright install-deps chromium
 
+# Anvil CLI: schema validation for anvil.yaml and client_code/**/form_template.yaml
+RUN npm install -g @anvil-works/anvil-cli
+
 USER scion
 
 # Playwright browser + pytest integration
