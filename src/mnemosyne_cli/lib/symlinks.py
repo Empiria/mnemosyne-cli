@@ -12,6 +12,25 @@ from pathlib import Path
 # Filename of the per-project skill allowlist inside claude-config/.
 SKILLS_YAML_FILENAME = "skills.yaml"
 
+# Default skill set written by `mnemosyne add` for new projects.
+# Mirrors the canonical infinite-worlds allowlist — a project that doesn't
+# need one of these can edit skills.yaml after creation.
+DEFAULT_SKILLS: list[str] = [
+    "clio",
+    "mnemosyne-capture",
+    "mnemosyne-debug",
+    "mnemosyne-execute",
+    "mnemosyne-fast",
+    "mnemosyne-new-milestone",
+    "mnemosyne-new-project",
+    "mnemosyne-pause",
+    "mnemosyne-plan",
+    "mnemosyne-progress",
+    "mnemosyne-quick",
+    "mnemosyne-resume",
+    "mnemosyne-search",
+]
+
 
 # ---------------------------------------------------------------------------
 # Legacy types — preserved for doctor.py callers on the migration path

@@ -468,15 +468,36 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                     )
 
             else:
-                # Scenario C — neither skills.yaml nor legacy commands exist
+                # Scenario C — neither skills.yaml nor legacy commands exist.
+                # Flag as a failure: without skills.yaml, `mnemosyne init` silently
+                # skips .claude/skills/ population. New projects scaffolded by
+                # `mnemosyne add` get one for free; older projects need it added.
+                _skills_yaml_path = skills_yaml
+
+                def _check_skills_yaml_exists(
+                    _path: Path = _skills_yaml_path,
+                ) -> CheckResult:
+                    if _path.exists():
+                        return CheckResult(
+                            ok=True,
+                            message=f"skills.yaml present at {_path}",
+                        )
+                    return CheckResult(
+                        ok=False,
+                        message=(
+                            f"Missing {_path} — without it, .claude/skills/ stays empty. "
+                            "Add a skills: list to that file in the vault "
+                            "(see projects/friendly-fox/infinite-worlds/claude-config/skills.yaml "
+                            "for a template), commit, and re-run mnemosyne doctor."
+                        ),
+                        fix_cmd=None,
+                    )
+
                 checks.append(
                     Check(
-                        name="skills.yaml not configured",
+                        name="claude-config/skills.yaml exists",
                         category="Skills",
-                        _check_fn=lambda: CheckResult(
-                            ok=True,
-                            message="No skills.yaml in claude-config/ (no skills configured for this project)",
-                        ),
+                        _check_fn=_check_skills_yaml_exists,
                     )
                 )
 

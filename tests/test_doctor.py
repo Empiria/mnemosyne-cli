@@ -429,3 +429,36 @@ def test_doctor_already_migrated_reports_green(tmp_path: Path) -> None:
     assert exit_code == 0, (
         "Expected exit 0 on already-migrated project (success criterion 2)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: missing skills.yaml is flagged (regression — was silently passing)
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_flags_missing_skills_yaml(tmp_path: Path) -> None:
+    """doctor surfaces a failing Skills check when skills.yaml is absent.
+
+    Regression: a project with no claude-config/skills.yaml and no legacy
+    commands/ used to pass silently, leaving init's `.claude/skills/` setup as
+    a no-op. The check must now fail so doctor reports the gap.
+    """
+    vault_path, project_path, vault_project_path = _setup_env(tmp_path)
+
+    # .planning symlink is what doctor uses to resolve which vault project
+    # the cwd belongs to, so the Skills checks need it wired up.
+    (project_path / ".planning").symlink_to(vault_project_path / "gsd-planning")
+
+    # No skills.yaml, no legacy commands — Scenario C
+    assert not (vault_project_path / "claude-config" / "skills.yaml").exists()
+    assert not (vault_project_path / "claude-config" / "commands").exists()
+
+    git_dir = project_path / ".git"
+    checks = doctor._build_checks(project_path, vault_path, git_dir)
+
+    skills_checks = [c for c in checks if c.category == "Skills"]
+    assert skills_checks, "Expected at least one Skills check"
+    results = [(c.name, c.check()) for c in skills_checks]
+    assert any(not r.ok for _, r in results), (
+        f"Expected a failing Skills check for missing skills.yaml; got {results}"
+    )

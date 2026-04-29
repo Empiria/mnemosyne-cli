@@ -9,6 +9,7 @@ import typer
 from rich.console import Console
 
 from mnemosyne_cli.lib import vault
+from mnemosyne_cli.lib.symlinks import DEFAULT_SKILLS, SKILLS_YAML_FILENAME
 
 console = Console()
 error_console = Console(stderr=True, style="bold red")
@@ -141,11 +142,23 @@ def run(
     dirs = [
         project_dir / "gsd-planning",
         project_dir / "claude-config" / "rules",
-        project_dir / "claude-config" / "commands",
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
         console.print(f"[green]Created[/green] {d.relative_to(vault_path)}/")
+
+    # Seed claude-config/skills.yaml so `mnemosyne init` populates .claude/skills/
+    # without requiring a manual follow-up. Projects that need a different set
+    # can edit this file after creation.
+    skills_yaml = project_dir / "claude-config" / SKILLS_YAML_FILENAME
+    skills_yaml.write_text(
+        "# claude-config/skills.yaml — per-project skill allowlist (vault-side)\n"
+        "# Each entry is a skill name at $MNEMOSYNE_VAULT/agents/skills/<name>/\n"
+        "skills:\n"
+        + "".join(f"  - {name}\n" for name in DEFAULT_SKILLS),
+        encoding="utf-8",
+    )
+    console.print(f"[green]Created[/green] {skills_yaml.relative_to(vault_path)}")
 
     # Create AGENTS.md from template
     agents_md = project_dir / "AGENTS.md"
