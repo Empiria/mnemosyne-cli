@@ -7,7 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from mnemosyne_cli.lib import vault
+from mnemosyne_cli.lib import broker, vault
 
 app = typer.Typer(no_args_is_help=True, help="Read and write CLI configuration.")
 console = Console()
@@ -34,6 +34,18 @@ def set_key(
             raise typer.Exit(1)
         vault.save_vault_path(p)
         console.print(f"vault_path = {p}")
+
+        # Keep the broker service file's MNEMOSYNE_VAULT_HOST in lockstep
+        # with config.toml. No-op if the service file isn't installed.
+        try:
+            if broker.sync_vault_host(p):
+                console.print(
+                    f"Patched MNEMOSYNE_VAULT_HOST in {broker.service_file_path()}"
+                )
+                console.print(f"Reload: {broker.reload_command()}")
+        except RuntimeError:
+            # Unsupported platform (e.g. Windows) — there's nothing to sync.
+            pass
 
 
 @app.command("get")
