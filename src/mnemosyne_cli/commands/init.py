@@ -227,8 +227,6 @@ def run(
         error_console.print(f"  [red]Error[/red] .envrc: {exc}")
         errors.append(".envrc")
 
-    console.print("  Run [bold]direnv allow[/bold] to activate the environment.")
-
     # --- Section: Registering merge drivers ---
     console.rule("[bold cyan]Registering merge drivers[/bold cyan]")
 
@@ -276,6 +274,4 @@ def run(
             "Run [bold]mnemosyne doctor[/bold] to check remaining issues.[/yellow]"
         )
     else:
-        console.print(
-            "[green]Setup complete.[/green] Run [bold]direnv allow[/bold] to activate the environment."
-        )
+        console.print("[green]Setup complete.[/green]")
