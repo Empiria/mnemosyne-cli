@@ -767,10 +767,15 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
 
         stale = []
         for name in ["mnemosyne-base", "mnemosyne-claude"]:
-            # Get local digest from the localhost/ tag that refresh creates
+            # Get local digests from the localhost/ tag that refresh creates.
+            # Podman stores multiple RepoDigests per image (e.g. manifest-list
+            # vs. image-manifest variants of the same content), so iterate the
+            # whole slice and substring-match below — picking only index 0
+            # produces false positives when the freshly-pulled digest lands at
+            # a higher index.
             local_result = subprocess.run(
                 ["podman", "image", "inspect", f"localhost/{name}:latest",
-                 "--format", "{{index .RepoDigests 0}}"],
+                 "--format", "{{range .RepoDigests}}{{.}} {{end}}"],
                 capture_output=True, text=True,
             )
             if local_result.returncode != 0:
