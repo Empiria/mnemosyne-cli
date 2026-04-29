@@ -11,6 +11,7 @@ from rich.table import Table
 
 from mnemosyne_cli.lib import envrc as lib_envrc
 from mnemosyne_cli.lib import git as lib_git
+from mnemosyne_cli.lib import overrides as lib_overrides
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.embeds import read_embed_targets
@@ -100,15 +101,31 @@ def run(
     elif not agents_target.exists():
         error_console.print(f"  [yellow]Skipped[/yellow] AGENTS.md (not found in vault: {agents_target})")
 
-    # 3. CLAUDE.md -> AGENTS.md (local, not absolute)
+    # 3. CLAUDE.md -> AGENTS.md (local, not absolute).
+    # If upstream tracks CLAUDE.md (e.g. the client added one), apply the
+    # full override pattern instead of a plain symlink — otherwise the
+    # symlink would land as a staged typechange that any `git commit -a`
+    # would push back to the client.
     claude_link = cwd / "CLAUDE.md"
-    try:
-        lib_symlinks.create_symlink(claude_link, Path("AGENTS.md"))
-        console.print("  [green]Created[/green] CLAUDE.md -> AGENTS.md")
-        created_symlinks.append("CLAUDE.md")
-    except Exception as exc:
-        error_console.print(f"  [red]Error[/red] CLAUDE.md: {exc}")
-        errors.append("CLAUDE.md")
+    if lib_overrides.is_tracked(cwd, "CLAUDE.md"):
+        try:
+            lib_overrides.apply_claude_md_override(cwd, git_dir)
+            console.print(
+                "  [green]Created[/green] CLAUDE.md -> AGENTS.md "
+                "(upstream-tracked: applied sparse-checkout + assume-unchanged)"
+            )
+            created_symlinks.append("CLAUDE.md")
+        except Exception as exc:
+            error_console.print(f"  [red]Error[/red] CLAUDE.md override: {exc}")
+            errors.append("CLAUDE.md")
+    else:
+        try:
+            lib_symlinks.create_symlink(claude_link, Path("AGENTS.md"))
+            console.print("  [green]Created[/green] CLAUDE.md -> AGENTS.md")
+            created_symlinks.append("CLAUDE.md")
+        except Exception as exc:
+            error_console.print(f"  [red]Error[/red] CLAUDE.md: {exc}")
+            errors.append("CLAUDE.md")
 
     # 4-6. Optional .claude/ symlinks
     claude_config = vault_project_path / "claude-config"

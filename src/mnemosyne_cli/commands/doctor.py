@@ -16,6 +16,7 @@ from rich.console import Console
 
 from mnemosyne_cli.lib import envrc as lib_envrc
 from mnemosyne_cli.lib import git as lib_git
+from mnemosyne_cli.lib import overrides as lib_overrides
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.embeds import read_embed_targets
@@ -197,16 +198,20 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                 )
             )
 
-            # CLAUDE.md (local symlink)
-            checks.append(
-                Check(
-                    name="CLAUDE.md local symlink",
-                    category="Symlinks",
-                    _check_fn=check_claude_md_local,
-                    _fix_fn=fix_claude_md_local,
-                    fix_description="Create CLAUDE.md -> AGENTS.md",
+            # CLAUDE.md (local symlink) — only when upstream doesn't track
+            # CLAUDE.md. When it does, the Local Overrides category covers
+            # both symlink existence AND the sparse-checkout/assume-unchanged
+            # plumbing needed to keep the symlink from leaking upstream.
+            if not lib_overrides.is_tracked(cwd, "CLAUDE.md"):
+                checks.append(
+                    Check(
+                        name="CLAUDE.md local symlink",
+                        category="Symlinks",
+                        _check_fn=check_claude_md_local,
+                        _fix_fn=fix_claude_md_local,
+                        fix_description="Create CLAUDE.md -> AGENTS.md",
+                    )
                 )
-            )
 
             # mnemosyne_scripts should not exist — replaced by CLI subcommands
             def check_no_mnemosyne_scripts() -> CheckResult:
@@ -562,57 +567,16 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
             )
 
         # --- Category: Local Overrides ---
-        # When upstream tracks a file we want to override locally (e.g. a
-        # client-provided CLAUDE.md, where we instead want CLAUDE.md to symlink
-        # to our vault-managed AGENTS.md), we need three things in place:
-        #   1. The local symlink itself.
-        #   2. A sparse-checkout exclusion so `git pull` doesn't overwrite it.
-        #   3. assume-unchanged so the typechange doesn't show in `git status`
-        #      and can't be staged accidentally. (skip-worktree silently fails
-        #      when the working-tree differs from the index, so it's not a
-        #      reliable substitute here.)
-        # Combined with the existing .git/info/exclude entry, this keeps the
-        # upstream content out of our agent context AND keeps the local
-        # symlink from leaking back upstream.
-
-        def _is_path_tracked(path: str) -> bool:
-            return subprocess.run(
-                ["git", "-C", str(cwd), "ls-files", "--error-unmatch", path],
-                capture_output=True,
-            ).returncode == 0
-
-        def _has_sparse_exclusion(path: str) -> bool:
-            sparse_file = git_dir / "info" / "sparse-checkout"
-            if not sparse_file.exists():
-                return False
-            return f"!/{path}" in sparse_file.read_text().splitlines()
-
-        def _has_assume_unchanged(path: str) -> bool:
-            result = subprocess.run(
-                ["git", "-C", str(cwd), "ls-files", "-v", path],
-                capture_output=True, text=True,
-            )
-            # `ls-files -v` uses lowercase letters for flagged entries:
-            # 'h' = assume-unchanged, 'S' = skip-worktree.
-            return result.stdout.startswith(("h ", "S "))
-
         # CLAUDE.md override — only relevant when AGENTS.md is our vault symlink
-        # AND upstream has begun tracking CLAUDE.md.
-        agents_md = cwd / "AGENTS.md"
-        if agents_md.is_symlink() and _is_path_tracked("CLAUDE.md"):
-            claude_md = cwd / "CLAUDE.md"
+        # AND upstream has begun tracking CLAUDE.md. Implementation lives in
+        # lib/overrides.py and is shared with `mnemosyne init`.
+        if (cwd / "AGENTS.md").is_symlink() and lib_overrides.is_tracked(cwd, "CLAUDE.md"):
 
             def check_claude_md_override(
-                _claude_md: Path = claude_md,
+                _cwd: Path = cwd,
                 _git_dir: Path = git_dir,
             ) -> CheckResult:
-                problems = []
-                if not _claude_md.is_symlink() or os.readlink(_claude_md) != "AGENTS.md":
-                    problems.append("not a symlink to AGENTS.md")
-                if not _has_sparse_exclusion("CLAUDE.md"):
-                    problems.append("no sparse-checkout exclusion")
-                if not _has_assume_unchanged("CLAUDE.md"):
-                    problems.append("not assume-unchanged")
+                problems = lib_overrides.diagnose_claude_md_override(_cwd, _git_dir)
                 if problems:
                     return CheckResult(
                         ok=False,
@@ -623,42 +587,9 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
 
             def fix_claude_md_override(
                 _cwd: Path = cwd,
-                _claude_md: Path = claude_md,
                 _git_dir: Path = git_dir,
             ) -> None:
-                # 1. Unstage any pending typechange so we don't carry it forward.
-                subprocess.run(
-                    ["git", "-C", str(_cwd), "restore", "--staged", "CLAUDE.md"],
-                    capture_output=True,
-                )
-                # 2. Remove the local file so sparse-checkout reapply can
-                #    cleanly mark the path SKIP_WORKTREE before we replace it.
-                if _claude_md.is_symlink() or _claude_md.exists():
-                    _claude_md.unlink()
-                # 3. Ensure sparse-checkout is enabled with the exclusion.
-                subprocess.run(
-                    ["git", "-C", str(_cwd), "config", "core.sparseCheckout", "true"],
-                    check=True,
-                )
-                sparse_file = _git_dir / "info" / "sparse-checkout"
-                sparse_file.parent.mkdir(parents=True, exist_ok=True)
-                lines = sparse_file.read_text().splitlines() if sparse_file.exists() else []
-                if not lines:
-                    lines = ["/*"]
-                if "!/CLAUDE.md" not in lines:
-                    lines.append("!/CLAUDE.md")
-                sparse_file.write_text("\n".join(lines) + "\n")
-                subprocess.run(
-                    ["git", "-C", str(_cwd), "sparse-checkout", "reapply"],
-                    check=True,
-                )
-                # 4. Re-create the symlink and pin it with assume-unchanged.
-                _claude_md.symlink_to("AGENTS.md")
-                subprocess.run(
-                    ["git", "-C", str(_cwd), "update-index",
-                     "--assume-unchanged", "CLAUDE.md"],
-                    check=True,
-                )
+                lib_overrides.apply_claude_md_override(_cwd, _git_dir)
 
             checks.append(
                 Check(
