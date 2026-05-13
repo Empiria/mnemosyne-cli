@@ -112,7 +112,7 @@ def context_monitor() -> None:
     except OSError: pass
     pa=bool(cwd and(pathlib.Path(cwd)/".planning"/"STATE.md").exists())
     if ic:
-        msg=("CONTEXT CRITICAL: Usage at "+str(used)+"%. Remaining: "+f"{rem:.0f}"+"%. Context nearly exhausted. Do NOT start new complex work. "+("GSD/mnemosyne state tracked in STATE.md. Inform user to run /mnemosyne-pause." if pa else "Inform user context is low."))
+        msg=("CONTEXT CRITICAL: Usage at "+str(used)+"%. Remaining: "+f"{rem:.0f}"+"%. Context nearly exhausted. Do NOT start new complex work. "+("GSD state tracked in STATE.md. Inform user to run /gsd-pause-work." if pa else "Inform user context is low."))
     else:
         msg=("CONTEXT WARNING: Usage at "+str(used)+"%. Remaining: "+f"{rem:.0f}"+"%. Context getting limited."+(" Inform user to prepare to pause." if pa else " Avoid new complex work."))
     sys.stdout.write(json.dumps({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":msg}}))

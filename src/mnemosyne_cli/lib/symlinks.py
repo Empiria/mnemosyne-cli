@@ -13,21 +13,13 @@ from pathlib import Path
 SKILLS_YAML_FILENAME = "skills.yaml"
 
 # Default skill set written by `mnemosyne add` for new projects.
-# Mirrors the canonical infinite-worlds allowlist — a project that doesn't
-# need one of these can edit skills.yaml after creation.
+#
+# Only vault-native skills are included. Workflow orchestration (plan, execute,
+# debug, pause/resume, etc.) is provided by upstream GSD, which is installed
+# separately and exposes its own /gsd-* commands.
 DEFAULT_SKILLS: list[str] = [
     "clio",
     "mnemosyne-capture",
-    "mnemosyne-debug",
-    "mnemosyne-execute",
-    "mnemosyne-fast",
-    "mnemosyne-new-milestone",
-    "mnemosyne-new-project",
-    "mnemosyne-pause",
-    "mnemosyne-plan",
-    "mnemosyne-progress",
-    "mnemosyne-quick",
-    "mnemosyne-resume",
     "mnemosyne-search",
 ]
 
@@ -67,9 +59,9 @@ def parse_skills_list(skills_yaml_path: Path) -> list[str]:
 
         # claude-config/skills.yaml — per-project skill allowlist
         skills:
-          - mnemosyne-plan
-          - mnemosyne-execute
-          - obsidian-skills
+          - mnemosyne-search
+          - mnemosyne-capture
+          - clio
     """
     if not skills_yaml_path.exists():
         return []
@@ -254,6 +246,47 @@ def check_skill_symlink(cwd: Path, skill_name: str, vault_path: Path) -> CheckRe
     name = cwd / ".claude" / "skills" / skill_name
     expected_target = vault_path / "agents" / "skills" / skill_name
     return check_symlink(name, expected_target)
+
+
+def find_orphan_skill_symlinks(cwd: Path, allowed_names: list[str]) -> list[str]:
+    """Return names of `.claude/skills/<name>` symlinks not in *allowed_names*.
+
+    Used by ``mnemosyne doctor`` to detect skill symlinks left behind when an
+    entry is removed from ``skills.yaml`` or when the vault skill directory is
+    deleted (e.g. when reverting from mnemosyne-* GSD wrappers back to upstream
+    GSD).  Symlinks whose target no longer resolves are also reported.
+
+    Returns an alphabetically-sorted list of orphan names.
+    """
+    skills_dir = cwd / ".claude" / "skills"
+    if not skills_dir.is_dir():
+        return []
+
+    allowed = set(allowed_names)
+    orphans: list[str] = []
+    for entry in skills_dir.iterdir():
+        if not entry.is_symlink():
+            continue
+        if entry.name in allowed and entry.exists():
+            continue
+        orphans.append(entry.name)
+    return sorted(orphans)
+
+
+def remove_skill_symlink(cwd: Path, skill_name: str) -> None:
+    """Remove ``.claude/skills/<skill_name>`` if it is a symlink.
+
+    No-op if the path does not exist.  Raises ``IsADirectoryError`` if a real
+    directory is present (so a user with a hand-maintained skill is warned
+    rather than silently losing files).
+    """
+    dest = cwd / ".claude" / "skills" / skill_name
+    if dest.is_symlink():
+        dest.unlink()
+    elif dest.is_dir():
+        raise IsADirectoryError(
+            f"{dest} is a real directory, not a symlink. Remove manually if intended."
+        )
 
 
 # ---------------------------------------------------------------------------
