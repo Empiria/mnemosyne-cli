@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import typer
 
-from mnemosyne_cli.commands import add, agent, broker, component, config, doctor, generate, hook, init, merge_driver, model, refresh, shellenv, status, statusline_cmd, vault_cmd, work
+from mnemosyne_cli.commands import add, agent, broker, component, config, doctor, generate, hook, init, merge_driver, refresh, shellenv, status, statusline_cmd, vault_cmd, work
 
 app = typer.Typer(
     name="mnemosyne",
@@ -20,7 +20,6 @@ app.command("refresh")(refresh.run)
 app.add_typer(generate.app, name="generate", help="Generate derived vault artifacts.")
 app.add_typer(agent.app, name="agent", help="Manage agent containers.")
 app.add_typer(config.app, name="config", help="Read and write CLI configuration.")
-app.add_typer(model.app, name="model", help="Manage subagent model selection.")
 app.add_typer(work.app, name="work", help="Manage worktree-based work sessions.")
 app.add_typer(vault_cmd.app, name="vault", help="Manage vault registry.")
 app.add_typer(merge_driver.app, name="merge-driver", help="Git merge drivers for GSD files.")
