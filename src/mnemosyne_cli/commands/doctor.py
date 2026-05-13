@@ -27,6 +27,8 @@ from mnemosyne_cli.lib.symlinks import (
     expand_skill_names,
     create_skill_symlink,
     check_skill_symlink,
+    find_orphan_skill_symlinks,
+    remove_skill_symlink,
 )
 from mnemosyne_cli.lib.techstack import discover_tech_rules, parse_tech_stack
 
@@ -466,6 +468,39 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                             fix_description=f"Create .claude/skills/{name}/ -> agents/skills/{name}/",
                         )
                     )
+
+                # Orphan / dangling skill symlinks — symlinks in .claude/skills/
+                # not listed in skills.yaml, or pointing at a vault skill that no
+                # longer exists.  Surfaces stale entries after a project's
+                # allowlist shrinks (e.g. the GSD-wrapper skill removal).
+                _allowed = list(skill_names)
+
+                def _check_orphans(_a: list[str] = _allowed) -> CheckResult:
+                    orphans = find_orphan_skill_symlinks(cwd, _a)
+                    if not orphans:
+                        return CheckResult(ok=True, message="no orphan .claude/skills/ entries")
+                    return CheckResult(
+                        ok=False,
+                        message=(
+                            f"orphan .claude/skills/ symlinks: {', '.join(orphans)} — "
+                            "not in skills.yaml or target missing"
+                        ),
+                        fix_cmd=None,
+                    )
+
+                def _fix_orphans(_a: list[str] = _allowed) -> None:
+                    for n in find_orphan_skill_symlinks(cwd, _a):
+                        remove_skill_symlink(cwd, n)
+
+                checks.append(
+                    Check(
+                        name=".claude/skills/ has no orphan symlinks",
+                        category="Skills",
+                        _check_fn=_check_orphans,
+                        _fix_fn=_fix_orphans,
+                        fix_description="Remove orphan .claude/skills/<name> symlinks",
+                    )
+                )
 
             else:
                 # Scenario C — neither skills.yaml nor legacy commands exist.
@@ -1035,6 +1070,35 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
             name="CLI version matches pyproject.toml",
             category="CLI",
             _check_fn=check_cli_version,
+        )
+    )
+
+    def check_model_profile_deprecated() -> CheckResult:
+        """Warn if the dead ``model_profile`` key lingers in config.toml.
+
+        The ``mnemosyne model`` command was removed when the GSD-wrapper skills
+        were retired (vault Phase 36).  The config key is no longer consulted,
+        and an unset key here is the desired state; we report-only so users can
+        remove it manually next time they edit the file.
+        """
+        cfg = lib_vault._read_config()
+        if "model_profile" in cfg:
+            return CheckResult(
+                ok=False,
+                message=(
+                    "config.toml still sets 'model_profile' — the key is no longer "
+                    "consulted (the 'mnemosyne model' command was removed). "
+                    "Remove it next time you edit ~/.config/mnemosyne/config.toml."
+                ),
+                fix_cmd=None,
+            )
+        return CheckResult(ok=True, message="no deprecated keys in config.toml")
+
+    checks.append(
+        Check(
+            name="config.toml has no deprecated keys",
+            category="CLI",
+            _check_fn=check_model_profile_deprecated,
         )
     )
 
