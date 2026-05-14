@@ -395,3 +395,53 @@ def multivault_config(
     monkeypatch.setenv("MNEMOSYNE_VAULT", str(vault_a))
 
     return vault_a, vault_b
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures added by Plan 38-01 (TDD RED phase — Phase 38 update command)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def existing_phase_md(synthetic_vault: Path) -> Path:
+    """Pre-create a phase.md with valid frontmatter + a user-edited body.
+
+    Used by tests that prove the body content is preserved across
+    apply_event + write_phase_md_atomic round trips. Per D-06 and
+    RESEARCH.md §Pattern 2: body is opaque, never rewritten.
+
+    Returns the path to the pre-created phase.md under
+    phases/27-complete-via-summaries/.
+    """
+    import frontmatter
+
+    phase_dir = (
+        synthetic_vault
+        / "projects"
+        / "empiria"
+        / "mnemosyne"
+        / "gsd-planning"
+        / "phases"
+        / "27-complete-via-summaries"
+    )
+    phase_md = phase_dir / "phase.md"
+    body = "## Manual notes\n\nThis was edited by a human.\n"
+    post = frontmatter.Post(
+        body,
+        tags=["phase"],
+        project="[[mnemosyne]]",
+        milestone="v1.0",
+        phase_number="27",
+        status="complete",
+        title="Complete via summaries",
+        depends_on=[],
+        blocked_on=None,
+        started_at="2026-04-01",
+        completed_at="2026-04-15",
+        summary="",
+        plan="[[27-01-PLAN]]",
+        summary_doc="[[27-SUMMARY]]",
+        validation=None,
+    )
+    phase_md.write_text(frontmatter.dumps(post) + "\n")
+    return phase_md
