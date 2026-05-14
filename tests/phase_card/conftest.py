@@ -258,8 +258,13 @@ def fake_git_repo(tmp_path: Path) -> Path:
 def closed_phase_dir(synthetic_vault: Path) -> Path:
     """Add a CLOSED-style phase (D-14) to ``synthetic_vault``.
 
-    Appends a ROADMAP entry containing ``CLOSED:`` text and creates the
-    matching phase directory. Used by ``test_closed_phase_gets_complete_with_explanation``.
+    Appends a ROADMAP entry whose post-em-dash text begins with ``CLOSED:``
+    and creates the matching phase directory. Used by
+    ``test_closed_phase_gets_complete_with_explanation``.
+
+    Uses phase number ``38`` (unused by the rest of ``synthetic_vault``) to
+    avoid colliding with the existing phase-18 ROADMAP entry, since
+    ``parse_phase_number`` strips text after the leading number.
 
     Returns the path to the new phase dir.
     """
@@ -267,7 +272,7 @@ def closed_phase_dir(synthetic_vault: Path) -> Path:
     roadmap = mneme_root / "gsd-planning" / "ROADMAP.md"
 
     closed_line = (
-        "- [x] **Phase 18-server-agent-infrastructure: Server Agent Infrastructure** "
+        "- [x] **Phase 38: server-agent-infrastructure** "
         "— CLOSED: infrastructure goals superseded by SCION\n"
     )
     existing = roadmap.read_text()
@@ -277,7 +282,7 @@ def closed_phase_dir(synthetic_vault: Path) -> Path:
         mneme_root
         / "gsd-planning"
         / "phases"
-        / "18-server-agent-infrastructure"
+        / "38-server-agent-infrastructure"
     )
     p_closed.mkdir(parents=True, exist_ok=True)
     return p_closed
@@ -341,11 +346,10 @@ def multivault_config(
 
     Returns ``(vault_a_path, vault_b_path)``.
 
-    The fixture clears any cached state and points ``HOME`` at ``tmp_path``
-    so the test runs against a clean ``~/.config/mnemosyne/config.toml``.
+    The fixture monkey-patches ``_CONFIG_PATH`` on the already-loaded
+    ``lib.vault`` module so the test sees a clean temp config without
+    requiring an ``importlib.reload`` (which would leak across tests).
     """
-    import importlib
-
     vault_a = synthetic_vault
     vault_b = tmp_path / "vault-b"
     vault_b.mkdir()
@@ -362,14 +366,6 @@ def multivault_config(
     )
     (b_mneme / "gsd-planning" / "ROADMAP.md").write_text("# Roadmap\n")
     (b_mneme / "gsd-planning" / "phases" / "01-secret").mkdir(parents=True)
-
-    # Redirect HOME so ~/.config/mnemosyne/config.toml is a fresh temp file
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    # vault.py caches _CONFIG_PATH at module load via Path("~/...").expanduser()
-    # — reload the module so it re-evaluates against the temp HOME.
-    from mnemosyne_cli.lib import vault as lib_vault
-    importlib.reload(lib_vault)
 
     config_dir = tmp_path / ".config" / "mnemosyne"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -388,8 +384,14 @@ def multivault_config(
         "# No [[vault_rules]] — closed by default (Phase 19-03).\n"
     )
 
+    # Re-target the module-level _CONFIG_PATH for this test only.
+    # monkeypatch.setattr restores the original value at teardown, so the
+    # next test sees the production config path again.
+    from mnemosyne_cli.lib import vault as lib_vault
+    monkeypatch.setattr(lib_vault, "_CONFIG_PATH", config_path)
+
     # MNEMOSYNE_VAULT pins the primary to vault A so resolve_primary_vault()
-    # picks empiria.
+    # matches the "empiria" registry entry by path.
     monkeypatch.setenv("MNEMOSYNE_VAULT", str(vault_a))
 
     return vault_a, vault_b
