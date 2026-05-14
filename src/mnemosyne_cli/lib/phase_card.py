@@ -251,20 +251,43 @@ def _resolve_project_slug(phase_dir: Path, vault_path: Path) -> str | None:
 def _project_note_path(phase_dir: Path, vault_path: Path, slug: str) -> Path:
     """Locate the project note.
 
-    Two conventions in the wild:
-      - ``projects/<org>/<slug>.md``         (next to the project dir)
-      - ``projects/<org>/<slug>/<slug>.md``  (inside the project dir)
+    Three conventions tried in order:
+      1. ``projects/<org>/<slug>/<slug>.md``        (inside the project dir, slug-named)
+      2. ``projects/<org>/<slug>/<Display Name>.md`` (inside, any .md tagged `project`)
+      3. ``projects/<org>/<slug>.md``                (next to the project dir, legacy)
 
-    The inner form is checked first because it's the convention this vault
-    actually uses; we fall back to the outer form to remain compatible with
-    other vaults that may follow the original schema.
+    Convention 2 covers vaults where project notes use Obsidian display-name
+    filenames (e.g. ``Infinite Worlds.md``, ``Proteus.md``, ``ORDS.md``) rather
+    than the directory slug. We pick the first ``*.md`` in the project root
+    whose frontmatter has ``project`` in its ``tags``.
+
+    Returns the chosen path; if no match found, returns the convention-1 path
+    (so the caller can emit its "missing project note" warning).
     """
     parts = _vault_relative_parts(phase_dir, vault_path)
     if parts is None or len(parts) < 4 or parts[0] != "projects":
         return vault_path / "projects" / f"{slug}.md"
-    inner = vault_path / "projects" / parts[1] / parts[2] / f"{parts[2]}.md"
-    if inner.is_file():
-        return inner
+
+    project_root = vault_path / "projects" / parts[1] / parts[2]
+    slug_named = project_root / f"{parts[2]}.md"
+    if slug_named.is_file():
+        return slug_named
+
+    if project_root.is_dir():
+        for candidate in sorted(project_root.glob("*.md")):
+            try:
+                post = frontmatter.load(str(candidate))
+            except Exception:
+                continue
+            tags = post.metadata.get("tags")
+            tag_list = (
+                tags if isinstance(tags, list)
+                else [tags] if isinstance(tags, str)
+                else []
+            )
+            if any(str(t).strip() == "project" for t in tag_list):
+                return candidate
+
     return vault_path / "projects" / parts[1] / f"{parts[2]}.md"
 
 
@@ -356,7 +379,9 @@ def derive_phase_card(
     phase_number = parse_phase_number(dir_name)
     slug = _resolve_project_slug(phase_dir, vault_path) or dir_name
     project_note = _project_note_path(phase_dir, vault_path, slug)
-    if not project_note.is_file():
+    if project_note.is_file():
+        wikilink_target = project_note.stem
+    else:
         try:
             rel_note = project_note.relative_to(vault_path)
         except ValueError:
@@ -365,7 +390,8 @@ def derive_phase_card(
             f"[yellow]warning:[/yellow] missing project note for [bold]{slug}[/bold] "
             f"(expected at {rel_note})"
         )
-    project_wikilink = f"[[{slug}]]"
+        wikilink_target = slug
+    project_wikilink = f"[[{wikilink_target}]]"
 
     # gsd-planning is the parent of `phases/`, which is the parent of phase_dir.
     project_root = phase_dir.parent.parent
