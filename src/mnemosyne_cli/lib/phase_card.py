@@ -336,6 +336,12 @@ def _derive_artifact_wikilinks(phase_dir: Path) -> tuple[str | None, str | None,
     Returns ``(plan_wikilink, summary_doc_wikilink, validation_wikilink)``
     where each value is either a display-name short-form wikilink
     (``[[XX-YY-PLAN]]``) or None.
+
+    Summary selection: prefers a phase-level summary (``<phase>-SUMMARY.md``,
+    no plan number component) over plan-level summaries (``<phase>-NN-SUMMARY.md``).
+    A phase-level summary stem has exactly one numeric/prefix component before
+    ``-SUMMARY``; a plan-level summary has two (phase + plan). This ensures
+    ``[[27-SUMMARY]]`` beats ``[[27-01-SUMMARY]]`` when both exist (impl-5 / D-17).
     """
     if not phase_dir.is_dir():
         return (None, None, None)
@@ -348,6 +354,15 @@ def _derive_artifact_wikilinks(phase_dir: Path) -> tuple[str | None, str | None,
         p for p in phase_dir.iterdir() if p.name.endswith("-VALIDATION.md")
     )
 
+    # Prefer a phase-level summary (e.g. 27-SUMMARY.md) over plan-level ones
+    # (e.g. 27-01-SUMMARY.md).  A phase-level summary stem has the shape
+    # ``<phase_prefix>-SUMMARY`` — the part before ``-SUMMARY`` does NOT contain
+    # a second hyphen-separated plan number.  Concretely: stem.count('-') == 1
+    # for ``27-SUMMARY``; stem.count('-') >= 2 for ``27-01-SUMMARY``.
+    _PLAN_NUM_RE = re.compile(r"^.+-\d{2}-SUMMARY$")
+    phase_level_summaries = [s for s in summaries if not _PLAN_NUM_RE.match(s.stem)]
+    chosen_summary = (phase_level_summaries or summaries)
+
     def _wikilink(p: Path | None) -> str | None:
         if p is None:
             return None
@@ -355,7 +370,7 @@ def _derive_artifact_wikilinks(phase_dir: Path) -> tuple[str | None, str | None,
 
     return (
         _wikilink(plans[0] if plans else None),
-        _wikilink(summaries[0] if summaries else None),
+        _wikilink(chosen_summary[0] if chosen_summary else None),
         _wikilink(validations[0] if validations else None),
     )
 
