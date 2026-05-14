@@ -10,6 +10,16 @@ Provides:
   mnemosyne/gsd-planning/``). Used to verify
   ``git_first_add_in_dir`` returns the *original* add date, not the
   rename commit date (RESEARCH §Pitfall 1).
+- ``closed_phase_dir`` — extends ``synthetic_vault`` with a CLOSED-style
+  phase directory (D-14 — ROADMAP entry has ``CLOSED:`` text) so the
+  backfill emits ``status: complete`` with explanatory ``summary:``.
+- ``phase_md_with_user_body`` — pre-creates a ``phase.md`` with user-edited
+  body text under existing frontmatter. Used to verify backfill preserves
+  body content verbatim (RESEARCH §Pattern 2).
+- ``multivault_config`` — registers two vaults in a temp config.toml with
+  no ``[[vault_rules]]`` (closed-by-default — Phase 19-03). Used to verify
+  vault B is NOT iterated when ``can_read(active, secondary)`` is False
+  (T-37-04 mitigation).
 """
 
 from __future__ import annotations
@@ -237,3 +247,149 @@ def fake_git_repo(tmp_path: Path) -> Path:
     _git_commit(vault, "add 27-01-SUMMARY for phase 27", "2026-04-18T09:00:00Z")
 
     return vault
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures added by Plan 37-03 (backfill writer)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def closed_phase_dir(synthetic_vault: Path) -> Path:
+    """Add a CLOSED-style phase (D-14) to ``synthetic_vault``.
+
+    Appends a ROADMAP entry containing ``CLOSED:`` text and creates the
+    matching phase directory. Used by ``test_closed_phase_gets_complete_with_explanation``.
+
+    Returns the path to the new phase dir.
+    """
+    mneme_root = synthetic_vault / "projects" / "empiria" / "mnemosyne"
+    roadmap = mneme_root / "gsd-planning" / "ROADMAP.md"
+
+    closed_line = (
+        "- [x] **Phase 18-server-agent-infrastructure: Server Agent Infrastructure** "
+        "— CLOSED: infrastructure goals superseded by SCION\n"
+    )
+    existing = roadmap.read_text()
+    roadmap.write_text(existing + "\n" + closed_line)
+
+    p_closed = (
+        mneme_root
+        / "gsd-planning"
+        / "phases"
+        / "18-server-agent-infrastructure"
+    )
+    p_closed.mkdir(parents=True, exist_ok=True)
+    return p_closed
+
+
+@pytest.fixture
+def phase_md_with_user_body(synthetic_vault: Path) -> Path:
+    """Pre-create a ``phase.md`` with valid frontmatter + a user-edited body.
+
+    The body content must survive a backfill run unchanged
+    (RESEARCH §Pattern 2 — frontmatter.Post(existing.content, **new_metadata)).
+
+    Returns the path to the pre-created phase.md.
+    """
+    phase_md = (
+        synthetic_vault
+        / "projects"
+        / "empiria"
+        / "mnemosyne"
+        / "gsd-planning"
+        / "phases"
+        / "27-complete-via-summaries"
+        / "phase.md"
+    )
+    phase_md.parent.mkdir(parents=True, exist_ok=True)
+    phase_md.write_text(
+        "---\n"
+        "tags:\n"
+        "- phase\n"
+        "project: \"[[mnemosyne]]\"\n"
+        "milestone: v1.0\n"
+        "phase_number: '27'\n"
+        "status: complete\n"
+        "title: complete via summaries\n"
+        "depends_on: []\n"
+        "blocked_on: null\n"
+        "started_at: null\n"
+        "completed_at: null\n"
+        "summary: ''\n"
+        "plan: null\n"
+        "summary_doc: null\n"
+        "validation: null\n"
+        "---\n\n"
+        "## Manual notes\n\n"
+        "This was edited by a human.\n"
+    )
+    return phase_md
+
+
+@pytest.fixture
+def multivault_config(
+    synthetic_vault: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    """Register two vaults in a temp XDG config.toml with NO cross-vault rules.
+
+    Vault A is ``synthetic_vault`` (populated). Vault B is a sibling temp dir
+    with its own minimal project layout. With no ``[[vault_rules]]`` entries,
+    ``can_read(A, B)`` returns False (closed by default per Phase 19-03).
+
+    Returns ``(vault_a_path, vault_b_path)``.
+
+    The fixture clears any cached state and points ``HOME`` at ``tmp_path``
+    so the test runs against a clean ``~/.config/mnemosyne/config.toml``.
+    """
+    import importlib
+
+    vault_a = synthetic_vault
+    vault_b = tmp_path / "vault-b"
+    vault_b.mkdir()
+    # Minimal project layout in vault B so phase discovery has something
+    # to find IF (counterfactually) backfill ever reached it.
+    b_mneme = vault_b / "projects" / "personal" / "playground"
+    b_mneme.mkdir(parents=True)
+    (vault_b / "projects" / "personal" / "playground.md").write_text(
+        "---\ntags: [project]\n---\n# playground\n"
+    )
+    (b_mneme / "gsd-planning").mkdir()
+    (b_mneme / "gsd-planning" / "STATE.md").write_text(
+        "---\nmilestone: v0.1\n---\n"
+    )
+    (b_mneme / "gsd-planning" / "ROADMAP.md").write_text("# Roadmap\n")
+    (b_mneme / "gsd-planning" / "phases" / "01-secret").mkdir(parents=True)
+
+    # Redirect HOME so ~/.config/mnemosyne/config.toml is a fresh temp file
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # vault.py caches _CONFIG_PATH at module load via Path("~/...").expanduser()
+    # — reload the module so it re-evaluates against the temp HOME.
+    from mnemosyne_cli.lib import vault as lib_vault
+    importlib.reload(lib_vault)
+
+    config_dir = tmp_path / ".config" / "mnemosyne"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        "[vaults.empiria]\n"
+        f'path = "{vault_a}"\n'
+        'description = "Empiria primary"\n'
+        'sync = "git"\n'
+        "\n"
+        "[vaults.personal]\n"
+        f'path = "{vault_b}"\n'
+        'description = "Personal sandbox"\n'
+        'sync = "git"\n'
+        "\n"
+        "# No [[vault_rules]] — closed by default (Phase 19-03).\n"
+    )
+
+    # MNEMOSYNE_VAULT pins the primary to vault A so resolve_primary_vault()
+    # picks empiria.
+    monkeypatch.setenv("MNEMOSYNE_VAULT", str(vault_a))
+
+    return vault_a, vault_b
