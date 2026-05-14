@@ -249,10 +249,22 @@ def _resolve_project_slug(phase_dir: Path, vault_path: Path) -> str | None:
 
 
 def _project_note_path(phase_dir: Path, vault_path: Path, slug: str) -> Path:
-    """Project note lives at `projects/<org>/<slug>.md` next to the project dir."""
+    """Locate the project note.
+
+    Two conventions in the wild:
+      - ``projects/<org>/<slug>.md``         (next to the project dir)
+      - ``projects/<org>/<slug>/<slug>.md``  (inside the project dir)
+
+    The inner form is checked first because it's the convention this vault
+    actually uses; we fall back to the outer form to remain compatible with
+    other vaults that may follow the original schema.
+    """
     parts = _vault_relative_parts(phase_dir, vault_path)
     if parts is None or len(parts) < 4 or parts[0] != "projects":
         return vault_path / "projects" / f"{slug}.md"
+    inner = vault_path / "projects" / parts[1] / parts[2] / f"{parts[2]}.md"
+    if inner.is_file():
+        return inner
     return vault_path / "projects" / parts[1] / f"{parts[2]}.md"
 
 
