@@ -18,10 +18,13 @@ Phase 38 contract — these names are stable:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import tempfile
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date
 from pathlib import Path
 
 import frontmatter
@@ -580,4 +583,219 @@ def discover_phase_dirs(
         d
         for d in (vault_path / "projects").glob("*/*/gsd-planning/phases/*")
         if d.is_dir()
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 38 additions — lifecycle event application, atomic write, helpers     #
+# --------------------------------------------------------------------------- #
+
+_VALID_EVENTS = {"added", "planned", "in-progress", "complete", "blocked", "unblocked"}
+
+# Events for which --phase is allowed to be omitted (STATE.md fallback applies).
+# Per RESEARCH.md Pitfall 2: cmdStateAddBlocker / cmdStateResolveBlocker don't
+# receive a phase number; Python infers from STATE.md's `Current Phase` field.
+_PHASE_OPTIONAL_EVENTS = {"blocked", "unblocked"}
+
+
+def apply_event(card: PhaseCard, event: str, reason: str | None = None) -> PhaseCard:
+    """Pure function: produce a new card with the event's mutations applied.
+
+    No I/O. Caller is responsible for writing the result. Raises ValueError
+    on unknown event or missing reason for 'blocked'.
+
+    Event → mutation map (CONTEXT.md D-03, copied verbatim):
+      added       → status=planned
+      planned     → status=ready (plan field set by derive)
+      in-progress → status=in-progress; started_at=today (preserve if already set)
+      complete    → status=complete; completed_at=today (summary_doc set by caller via re-derive)
+      blocked     → status=blocked; blocked_on=reason (reason required)
+      unblocked   → blocked_on=None (status restored by caller via re-derive)
+    """
+    if event not in _VALID_EVENTS:
+        raise ValueError(f"Unknown event: {event!r}. Valid: {sorted(_VALID_EVENTS)}")
+
+    today = date.today().isoformat()  # YYYY-MM-DD
+
+    if event == "added":
+        return replace(card, status="planned")
+    if event == "planned":
+        return replace(card, status="ready")
+    if event == "in-progress":
+        new_started = card.started_at or today  # first-start-wins
+        return replace(card, status="in-progress", started_at=new_started)
+    if event == "complete":
+        return replace(card, status="complete", completed_at=today)
+    if event == "blocked":
+        if not reason:
+            raise ValueError("--reason is required for --event blocked")
+        return replace(card, status="blocked", blocked_on=reason)
+    if event == "unblocked":
+        return replace(card, blocked_on=None)
+
+    raise AssertionError(f"unreachable: {event}")
+
+
+_PHASE_DIR_PREFIX_RE = re.compile(r"^(\d+(?:-\d+)?|empiria-\d+)-")
+
+
+def resolve_phase_dir(vault: Path, phase_id: str, project: str | None = None) -> Path | None:
+    """Find the phase directory for a given phase identifier.
+
+    Args:
+      vault: vault root Path
+      phase_id: '38' | '195.02' | 'empiria-01'
+      project: vault-relative project path (e.g. 'empiria/mnemosyne'); None = search all
+
+    Returns: Path to the phase directory, or None if not found or ambiguous (>=2 matches).
+
+    Path traversal mitigation (T-37-01 carry-forward): reject project containing
+    '..' or starting with '/'.
+    """
+    phase_dir_prefix = phase_id.replace(".", "-")
+
+    if project is not None:
+        if ".." in project or project.startswith("/"):
+            return None
+        # Reuse Phase 37's validator for stronger checks (raises ValueError on bad slug).
+        try:
+            validated = validate_project_slug(project, vault)
+        except (ValueError, Exception):
+            return None
+        search_root = validated / "gsd-planning" / "phases"
+        if not search_root.is_dir():
+            return None
+        candidates = [
+            d for d in search_root.iterdir()
+            if d.is_dir() and d.name.startswith(phase_dir_prefix + "-")
+        ]
+    else:
+        candidates = [
+            c for c in vault.glob(f"projects/*/*/gsd-planning/phases/{phase_dir_prefix}-*")
+            if c.is_dir()
+        ]
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return None  # 0 or >=2 — caller decides (D-08: silent skip)
+
+
+# Match lines like "**Current Phase:** 38" or "Current Phase: 38-some-slug"
+# in the STATE.md frontmatter or body. Tolerate bold/asterisks and trailing text.
+_CURRENT_PHASE_RE = re.compile(
+    r"^\s*(?:\*{0,2}\s*)?Current Phase\s*(?:\*{0,2})\s*:\s*(?:\*{0,2}\s*)?(?P<id>[\w.-]+)",
+    re.MULTILINE,
+)
+
+
+def read_current_phase_from_state(vault: Path, project: str | None = None) -> str | None:
+    """Read STATE.md and return the phase identifier of the current phase.
+
+    Used by `mnemosyne phase update` when --phase is omitted for blocker/unblocker
+    events (RESEARCH.md Open Question 4 + Pitfall 2 resolution).
+
+    Args:
+      vault: vault root Path
+      project: vault-relative project slug (e.g. 'empiria/mnemosyne'). If None,
+        STATE.md cannot be located deterministically (we have no single-project
+        STATE.md path), so we return None.
+
+    Returns: phase identifier string ('38', '195.02', 'empiria-01'), or None if
+      STATE.md cannot be read, parsed, or has no `Current Phase` field.
+
+    Silent-no-op semantics: never raises. Returns None on any I/O or parse failure
+    so the caller can emit a stderr warning and exit 0 (D-08).
+    """
+    if project is None:
+        return None
+    try:
+        validated = validate_project_slug(project, vault)
+    except Exception:
+        return None
+    state_md = validated / "gsd-planning" / "STATE.md"
+    if not state_md.is_file():
+        return None
+    try:
+        contents = state_md.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    # Try frontmatter first (a structured `current_phase:` key wins if present).
+    try:
+        post = frontmatter.loads(contents)
+        for key in ("current_phase", "currentPhase", "Current Phase"):
+            value = post.metadata.get(key)
+            if value:
+                # Strip wikilink decoration if any: [[38-foo]] → 38-foo → 38
+                raw = str(value).strip("[] ")
+                # Take the leading phase ID (digits or empiria-NN) before any '-slug'
+                m = re.match(r"^(empiria-\d+|\d+(?:\.\d+)?)", raw)
+                if m:
+                    return m.group(1)
+                return raw or None
+    except Exception:
+        pass  # fall through to regex body scan
+
+    # Fallback: scan the body for `Current Phase: X` lines.
+    m = _CURRENT_PHASE_RE.search(contents)
+    if m:
+        raw = m.group("id").strip("[] ")
+        m2 = re.match(r"^(empiria-\d+|\d+(?:\.\d+)?)", raw)
+        if m2:
+            return m2.group(1)
+        return raw or None
+
+    return None
+
+
+def write_phase_md_atomic(target: Path, card: PhaseCard, body: str = "") -> None:
+    """Atomic write: temp file in same dir → fsync → os.replace.
+
+    POSIX + Windows atomic (Pitfall 5: os.replace, NOT os.rename).
+    Body preserved verbatim — frontmatter-only mutation (D-06).
+    """
+    metadata = dict(card_to_dict(card))
+    post = frontmatter.Post(body, **metadata)
+    serialized = frontmatter.dumps(post) + "\n"
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(
+        prefix=".phase.md.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())  # durability before rename
+        os.replace(str(tmp_path), str(target))  # atomic on POSIX + Windows (Python 3.3+)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def card_from_frontmatter(metadata: dict) -> PhaseCard:
+    """Reverse of card_to_dict — reconstruct PhaseCard from a parsed frontmatter dict.
+
+    Tolerates missing optional fields (returns dataclass defaults).
+    """
+    return PhaseCard(
+        project=metadata.get("project", ""),
+        milestone=metadata.get("milestone"),
+        phase_number=str(metadata.get("phase_number", "")),
+        status=metadata.get("status", "planned"),
+        title=metadata.get("title", ""),
+        depends_on=list(metadata.get("depends_on") or []),
+        blocked_on=metadata.get("blocked_on"),
+        started_at=metadata.get("started_at"),
+        completed_at=metadata.get("completed_at"),
+        summary=metadata.get("summary", "") or "",
+        plan=metadata.get("plan"),
+        summary_doc=metadata.get("summary_doc"),
+        validation=metadata.get("validation"),
     )
