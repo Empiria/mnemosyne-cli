@@ -62,6 +62,9 @@ ENV PATH="/home/scion/.cargo/bin:$PATH"
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
 
+# GSD: phase-based workflow skills, agents, and hooks for Claude Code
+RUN npx --yes get-shit-done-cc --claude --global
+
 # Run as root so sciontool init can chown mounted volumes before dropping
 # to scion. Requires the podman ExecUser fix (scion PR #XX) so the broker
 # execs as scion to find the tmux socket at /tmp/tmux-1000/.
