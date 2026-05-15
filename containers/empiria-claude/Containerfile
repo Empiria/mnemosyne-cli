@@ -59,6 +59,11 @@ RUN uv pip install git+https://github.com/Empiria/mnemosyne-cli.git
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
 ENV PATH="/home/scion/.cargo/bin:$PATH"
 
+# Native Claude Code build (~/.local/bin/claude) — scion-claude base ships
+# the npm-global install, which nags to migrate. PATH already prefers
+# ~/.local/bin so the native binary wins.
+RUN claude install stable
+
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
 
