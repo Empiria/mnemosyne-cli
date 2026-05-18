@@ -15,7 +15,9 @@ from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import overrides as lib_overrides
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
+from mnemosyne_cli.lib.checks import run_container_checks
 from mnemosyne_cli.lib.setup import setup_worktree_symlinks
+from mnemosyne_cli.lib.skills import discover_vault_skills
 
 console = Console()
 error_console = Console(stderr=True, style="bold red")
@@ -135,6 +137,25 @@ def _run_container(project: str | None, target: Path | None) -> None:
         error_console.print(f"  [red]Error[/red] symlink setup: {exc}")
         # Non-fatal: keep going so we still register merge drivers / hooks if possible
 
+    # --- Vault-wide skill surface (D-09, D-10) ---
+    # Every vault skill becomes ~/.claude/skills/<name>/ so the in-container
+    # Claude session can invoke it regardless of project-level skills.yaml.
+    # This is the agent-wide surface; the project-scoped surface created by
+    # setup_worktree_symlinks (skills.yaml-driven) is preserved unchanged.
+    user_skills_dir = Path.home() / ".claude" / "skills"
+    user_skills_dir.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for name, skill_dir in discover_vault_skills(vault_path):
+        link = user_skills_dir / name
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(skill_dir, target_is_directory=True)
+            linked += 1
+        except OSError as exc:
+            error_console.print(f"  [yellow]Warning[/yellow] vault skill {name}: {exc}")
+    console.print(f"  [green]Linked[/green] {linked} vault skills into ~/.claude/skills/")
+
     # --- Git exclusions (no .envrc per D-08) ---
     always_exclude = [".planning", "AGENTS.md", "CLAUDE.md"]
     optional_excludes = [".claude/rules", ".claude/skills", ".claude/settings.json"]
@@ -164,6 +185,25 @@ def _run_container(project: str | None, target: Path | None) -> None:
             error_console.print(f"  [yellow]Warning[/yellow] .git/hooks/{hook_name}: {exc}")
 
     console.print("[green]Container bootstrap complete.[/green]")
+
+    # --- Self-verify summary (D-23) ---
+    # Run the same checks `mnemosyne doctor --container` runs (lib/checks.py).
+    # Failures are non-fatal — D-06 carry-forward: bootstrap failure must not
+    # kill the agent. Output goes to stderr so it is visible in container logs
+    # without polluting stdout for any scripted callers.
+    error_console.print()
+    error_console.print("[bold]Self-verify[/bold] (mnemosyne doctor --container subset):")
+    results = run_container_checks(target, vault_path)
+    passed = 0
+    failed = 0
+    for result in results:
+        if result.ok:
+            error_console.print(f"  PASS: {result.message}")
+            passed += 1
+        else:
+            error_console.print(f"  FAIL: {result.message}")
+            failed += 1
+    error_console.print(f"[bold]{passed}/{passed + failed} checks passed[/bold]")
 
 
 # ---------------------------------------------------------------------------
