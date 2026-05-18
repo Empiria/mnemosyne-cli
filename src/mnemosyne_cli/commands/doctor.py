@@ -14,9 +14,11 @@ from typing import Callable
 import typer
 from rich.console import Console
 
+from mnemosyne_cli.lib import checks as lib_checks
 from mnemosyne_cli.lib import envrc as lib_envrc
 from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import overrides as lib_overrides
+from mnemosyne_cli.lib import scion_cache as lib_scion_cache
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.embeds import read_embed_targets
@@ -62,9 +64,59 @@ class Check:
             self._fix_fn()
 
 
-def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
+def _build_checks(
+    cwd: Path,
+    vault_path: Path,
+    git_dir: Path,
+    container: bool = False,
+) -> list[Check]:
     """Build the full list of checks for the current directory."""
     checks: list[Check] = []
+
+    if container:
+        # D-21 / D-22: in-container bootstrap checks only.
+        # Host-codebase categories (Symlinks, Skills, .claude/rules, etc.) are
+        # designed for client-codebase host runs and would FAIL inside a
+        # container where cwd is /workspace. Skip them entirely.
+        target_str = os.environ.get("MNEMOSYNE_WORKSPACE", "/workspace")
+        target = Path(target_str)
+
+        def _wrap(check_fn: Callable[[], CheckResult], name: str) -> Check:
+            # Container checks are READ-ONLY per D-21 — no _fix_fn attached.
+            return Check(
+                name=name,
+                category="Container Bootstrap",
+                _check_fn=check_fn,
+            )
+
+        checks.append(_wrap(lib_checks.check_mnemosyne_on_path, "mnemosyne on PATH"))
+        checks.append(_wrap(lib_checks.check_gsd_tools_on_path, "gsd-tools on PATH"))
+        checks.append(
+            _wrap(
+                lambda: lib_checks.check_user_skills_populated(vault_path),
+                "~/.claude/skills populated",
+            )
+        )
+        checks.append(
+            _wrap(
+                lambda: lib_checks.check_workspace_planning(target, vault_path),
+                "/workspace/.planning resolves into vault",
+            )
+        )
+        checks.append(
+            _wrap(
+                lib_checks.check_required_env_vars,
+                "MNEMOSYNE_WORKSPACE + MNEMOSYNE_PROJECT set",
+            )
+        )
+        checks.append(
+            _wrap(
+                lib_checks.check_init_status_file,
+                "post-start hook last run succeeded",
+            )
+        )
+
+        return checks
 
     # --- Category: Environment ---
 
@@ -1147,6 +1199,93 @@ def _build_checks(cwd: Path, vault_path: Path, git_dir: Path) -> list[Check]:
                 _check_fn=_make_check(component_name),
             ))
 
+    # --- Category: SCION Template Freshness (SBR-06, D-18/D-19/D-20) ---
+    # Detect drift between the broker's cached template and the vault's
+    # agents/scion-template/. Skips silently on machines that don't run a
+    # broker (D-19 graceful skip).
+
+    cache_root = lib_scion_cache.find_broker_cache_root()
+    if cache_root is None:
+
+        def _check_no_broker() -> CheckResult:
+            return CheckResult(
+                ok=True,
+                message="broker not on this machine — SCION template freshness skipped",
+            )
+
+        checks.append(
+            Check(
+                name="SCION broker cache",
+                category="SCION Template Freshness",
+                _check_fn=_check_no_broker,
+            )
+        )
+    else:
+        index = lib_scion_cache.read_template_index(cache_root)
+        if not index or not index.get("entries"):
+
+            def _check_no_index() -> CheckResult:
+                return CheckResult(
+                    ok=True,
+                    message=f"broker cache empty at {cache_root} — nothing to diff",
+                )
+
+            checks.append(
+                Check(
+                    name="SCION broker cache index",
+                    category="SCION Template Freshness",
+                    _check_fn=_check_no_index,
+                )
+            )
+        else:
+            # Vault-side template-dir mapping by convention. Phase 34
+            # (scion-template-mnemosyne) will add mnemosyne-agent once that
+            # template ships — out of scope here per D-05.
+            template_id_to_vault_dir = {
+                "empiria-agent": vault_path / "agents" / "scion-template",
+            }
+            for tid, vdir in template_id_to_vault_dir.items():
+                if tid not in index.get("entries", {}):
+                    continue
+                if not vdir.is_dir():
+                    continue
+
+                def _make_drift_check(
+                    tid_local: str, vdir_local: Path, cache_root_local: Path
+                ) -> Callable[[], CheckResult]:
+                    def _check() -> CheckResult:
+                        drift = lib_scion_cache.diff_template_against_vault(
+                            cache_root_local, tid_local, vdir_local
+                        )
+                        if not drift:
+                            return CheckResult(
+                                ok=True,
+                                message=f"{tid_local} in sync with vault",
+                            )
+                        return CheckResult(
+                            ok=False,
+                            message=(
+                                f"{tid_local} drift: "
+                                f"{len(drift)} file(s) differ — {', '.join(drift[:5])}"
+                                f"{' …' if len(drift) > 5 else ''}"
+                            ),
+                            fix_cmd=(
+                                f"scion template sync {tid_local} && "
+                                f"rm -rf ~/.scion/cache/templates && "
+                                f"systemctl --user restart scion-broker"
+                            ),
+                        )
+
+                    return _check
+
+                checks.append(
+                    Check(
+                        name=f"{tid} template freshness",
+                        category="SCION Template Freshness",
+                        _check_fn=_make_drift_check(tid, vdir, cache_root),
+                    )
+                )
+
     return checks
 
 
@@ -1162,21 +1301,37 @@ def _components_apply_here(cwd: Path, vault_path: Path) -> bool:
 
 def run(
     fix: bool = typer.Option(False, "--fix", help="Apply fixes with per-fix confirmation"),
+    container: bool = typer.Option(
+        False,
+        "--container",
+        help="Run in-container bootstrap checks (D-22) instead of host-codebase checks",
+    ),
 ) -> None:
     """Validate project setup and report issues."""
+    # Normalise typer sentinels for programmatic callers (tests invoke run()
+    # directly without going through the CLI plumbing, leaving these as
+    # typer.OptionInfo instances rather than the documented False default).
+    if isinstance(fix, typer.models.OptionInfo):
+        fix = False
+    if isinstance(container, typer.models.OptionInfo):
+        container = False
+
     cwd = Path.cwd()
 
     # Resolve vault path
     vault_path = lib_vault.resolve_vault_path()
 
-    # Get git dir (needed for exclusion checks)
-    try:
-        git_dir = lib_git.get_git_dir(cwd)
-    except Exception:
-        # If not in a git repo, git_dir won't be usable — use a sentinel
+    if container:
+        # Container mode skips the git-repo requirement; _build_checks does
+        # not consume git_dir when container=True.
         git_dir = cwd / ".git"
+    else:
+        try:
+            git_dir = lib_git.get_git_dir(cwd)
+        except Exception:
+            git_dir = cwd / ".git"
 
-    checks = _build_checks(cwd, vault_path, git_dir)
+    checks = _build_checks(cwd, vault_path, git_dir, container=container)
 
     # Group checks by category
     categories: dict[str, list[Check]] = {}
