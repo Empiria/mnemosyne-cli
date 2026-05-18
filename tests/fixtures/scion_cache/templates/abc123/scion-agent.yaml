@@ -1,0 +1,8 @@
+schema_version: "1"
+description: "Empiria development agent with vault access and mnemosyne tooling"
+agent_instructions: agents.md
+image: ghcr.io/empiria/empiria-claude:latest
+env:
+  MNEMOSYNE_VAULT: /vault
+  MNEMOSYNE_CONTAINER: "1"
+  SSH_AUTH_SOCK: /run/ssh-agent
