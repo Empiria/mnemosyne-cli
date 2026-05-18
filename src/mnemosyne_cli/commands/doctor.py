@@ -78,8 +78,24 @@ def _build_checks(
         # Host-codebase categories (Symlinks, Skills, .claude/rules, etc.) are
         # designed for client-codebase host runs and would FAIL inside a
         # container where cwd is /workspace. Skip them entirely.
-        target_str = os.environ.get("MNEMOSYNE_WORKSPACE", "/workspace")
-        target = Path(target_str)
+        #
+        # Workspace resolution mirrors the post-start hook: prefer the
+        # SCION-derived path /repo-root/.scion/agents/$SCION_AGENT_SLUG/workspace
+        # when it exists (the real git worktree), then fall back to
+        # MNEMOSYNE_WORKSPACE, then /workspace. The template-level
+        # MNEMOSYNE_WORKSPACE=/workspace points at an empty placeholder dir
+        # inside the image — not the agent's actual workspace.
+        scion_slug = os.environ.get("SCION_AGENT_SLUG", "")
+        scion_workspace = (
+            Path(f"/repo-root/.scion/agents/{scion_slug}/workspace")
+            if scion_slug
+            else None
+        )
+        if scion_workspace is not None and scion_workspace.is_dir():
+            target = scion_workspace
+        else:
+            target_str = os.environ.get("MNEMOSYNE_WORKSPACE", "/workspace")
+            target = Path(target_str)
 
         def _wrap(check_fn: Callable[[], CheckResult], name: str) -> Check:
             # Container checks are READ-ONLY per D-21 — no _fix_fn attached.
