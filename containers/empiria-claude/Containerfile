@@ -38,27 +38,37 @@ RUN npm install -g @tobilu/qmd && \
 # ctx7: library documentation lookup
 RUN npm install -g ctx7
 
-# Switch to scion user for installing user-level tools
+# Empiria install root that survives SCION's runtime mount overlay of /home/scion.
+# The broker bind-mounts <grove>/agents/<agent>/home:/home/scion at agent start,
+# which clobbers anything installed under /home/scion (Phase 33.1 Plan 33.1-05
+# finding). Tools that must be available inside a SCION agent are installed under
+# /opt/empiria/ instead.
+USER root
+RUN mkdir -p /opt/empiria && chown scion:scion /opt/empiria
 USER scion
 
 # Pre-create qmd cache dir so volume mounts don't make it root-owned
 RUN mkdir -p ~/.cache/qmd
 
-# uv + Python: managed environment
+# uv + Python: managed environment. uv installer goes to ~/.local/bin (build-time
+# only — not used at runtime inside SCION agents). The persistent venv lives at
+# /opt/empiria/.venv so the SCION /home/scion mount cannot clobber it.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/home/scion/.local/bin:$PATH"
 RUN uv python install 3.13
-RUN uv venv /home/scion/.venv
-ENV VIRTUAL_ENV="/home/scion/.venv"
-ENV PATH="/home/scion/.venv/bin:$PATH"
+RUN uv venv /opt/empiria/.venv
+ENV VIRTUAL_ENV="/opt/empiria/.venv"
+ENV PATH="/opt/empiria/.venv/bin:$PATH"
 
 # mnemosyne CLI: vault operational commands.
 # uv pip can exit 0 with a partial install under network flakiness; the
 # `test -x` + `--help` guard fails the build if the binary did not materialise.
 # Surfaces silent install regressions at CI time, not after agent start.
+# Installed to /opt/empiria/.venv/bin/mnemosyne (NOT /home/scion/.venv/...) so the
+# binary survives SCION's home-directory mount overlay.
 RUN uv pip install git+https://github.com/Empiria/mnemosyne-cli.git \
- && test -x /home/scion/.venv/bin/mnemosyne \
- && /home/scion/.venv/bin/mnemosyne --help >/dev/null
+ && test -x /opt/empiria/.venv/bin/mnemosyne \
+ && /opt/empiria/.venv/bin/mnemosyne --help >/dev/null
 
 # rustup: Rust toolchain for cargo dependencies
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
