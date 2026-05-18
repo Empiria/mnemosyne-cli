@@ -51,10 +51,16 @@ USER scion
 RUN mkdir -p ~/.cache/qmd
 
 # uv + Python: managed environment. uv installer goes to ~/.local/bin (build-time
-# only — not used at runtime inside SCION agents). The persistent venv lives at
-# /opt/empiria/.venv so the SCION /home/scion mount cannot clobber it.
+# only — not used at runtime inside SCION agents). The persistent venv AND the
+# Python interpreter it points at live under /opt/empiria/ so neither survives
+# the SCION /home/scion mount overlay.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/home/scion/.local/bin:$PATH"
+# UV_PYTHON_INSTALL_DIR controls where `uv python install` materialises the
+# interpreter. Default is ~/.local/share/uv/python (lives under /home/scion);
+# we redirect it to /opt/empiria so the venv's `python` symlink stays valid
+# at agent runtime.
+ENV UV_PYTHON_INSTALL_DIR=/opt/empiria/python
 RUN uv python install 3.13
 RUN uv venv /opt/empiria/.venv
 ENV VIRTUAL_ENV="/opt/empiria/.venv"
