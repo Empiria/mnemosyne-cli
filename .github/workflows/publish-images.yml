@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - 'containers/**'
+      - 'src/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
   workflow_dispatch:
 
 env:

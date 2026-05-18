@@ -52,8 +52,13 @@ RUN uv venv /home/scion/.venv
 ENV VIRTUAL_ENV="/home/scion/.venv"
 ENV PATH="/home/scion/.venv/bin:$PATH"
 
-# mnemosyne CLI: vault operational commands
-RUN uv pip install git+https://github.com/Empiria/mnemosyne-cli.git
+# mnemosyne CLI: vault operational commands.
+# uv pip can exit 0 with a partial install under network flakiness; the
+# `test -x` + `--help` guard fails the build if the binary did not materialise.
+# Surfaces silent install regressions at CI time, not after agent start.
+RUN uv pip install git+https://github.com/Empiria/mnemosyne-cli.git \
+ && test -x /home/scion/.venv/bin/mnemosyne \
+ && /home/scion/.venv/bin/mnemosyne --help >/dev/null
 
 # rustup: Rust toolchain for cargo dependencies
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
@@ -67,8 +72,14 @@ RUN claude install stable
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
 
-# GSD: phase-based workflow skills, agents, and hooks for Claude Code
-RUN npx --yes get-shit-done-cc --claude --global
+# GSD: phase-based workflow skills, agents, and hooks for Claude Code.
+# Two-step install: step 1 puts gsd-tools / gsd-sdk on PATH via npm bin map
+# (npm-global prefix on PATH from core-base); step 2 runs the GSD installer
+# whose --global flag writes config into ~/.claude/ (NOT npm's -g).
+# The which-check fails the build if the binary did not register.
+RUN npm install -g get-shit-done-cc \
+ && get-shit-done-cc --claude --global \
+ && which gsd-tools >/dev/null
 
 # Run as root so sciontool init can chown mounted volumes before dropping
 # to scion. Requires the podman ExecUser fix (scion PR #XX) so the broker
