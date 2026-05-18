@@ -73,12 +73,19 @@ RUN claude install stable
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
 
 # GSD: phase-based workflow skills, agents, and hooks for Claude Code.
-# Two-step install: step 1 puts gsd-tools / gsd-sdk on PATH via npm bin map
-# (npm-global prefix on PATH from core-base); step 2 runs the GSD installer
-# whose --global flag writes config into ~/.claude/ (NOT npm's -g).
-# The which-check fails the build if the binary did not register.
+# Three-step install:
+#   1. `npm install -g get-shit-done-cc` puts the installer on PATH.
+#   2. `get-shit-done-cc --claude --global` runs the installer (writes config
+#      into ~/.claude/; --global is the installer's own flag, NOT npm -g).
+#   3. The get-shit-done-cc npm package ships `gsd-tools` as a library
+#      script (bin/gsd-tools.cjs) rather than a declared bin entry, so
+#      `npm install -g` does NOT expose `gsd-tools` on PATH. We symlink
+#      the .cjs (executable, `#!/usr/bin/env node` shebang) into the
+#      npm-global bin dir which IS on the runtime PATH.
+# The which-check fails the build if the symlink did not register.
 RUN npm install -g get-shit-done-cc \
  && get-shit-done-cc --claude --global \
+ && ln -sf /usr/local/share/npm-global/lib/node_modules/get-shit-done-cc/get-shit-done/bin/gsd-tools.cjs /usr/local/share/npm-global/bin/gsd-tools \
  && which gsd-tools >/dev/null
 
 # Run as root so sciontool init can chown mounted volumes before dropping
