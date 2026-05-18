@@ -87,10 +87,16 @@ RUN echo "Installing mnemosyne-cli (cache-bust rev=${MNEMOSYNE_REV})" \
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
 ENV PATH="/home/scion/.cargo/bin:$PATH"
 
-# Native Claude Code build (~/.local/bin/claude) — scion-claude base ships
-# the npm-global install, which nags to migrate. PATH already prefers
-# ~/.local/bin so the native binary wins.
-RUN claude install stable
+# Native Claude Code is intentionally NOT installed here. Previous versions
+# of this Containerfile ran `claude install stable` which lands in
+# ~/.local/bin/claude — but SCION's runtime mount overlay at /home/scion
+# masks ~/.local entirely, so the native binary is unreachable inside a
+# live agent. The fallback is the npm-global claude shipped by the
+# scion-claude parent image (at /usr/local/share/npm-global/bin/claude,
+# which is outside the mount). The npm-global claude auto-update writes
+# to its install dir which IS writable; users may see a "couldn't auto-
+# update" warning when the dir isn't writable in some configurations —
+# cosmetic, the binary still works.
 
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
