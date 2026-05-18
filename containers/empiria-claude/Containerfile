@@ -72,7 +72,14 @@ ENV PATH="/opt/empiria/.venv/bin:$PATH"
 # Surfaces silent install regressions at CI time, not after agent start.
 # Installed to /opt/empiria/.venv/bin/mnemosyne (NOT /home/scion/.venv/...) so the
 # binary survives SCION's home-directory mount overlay.
-RUN uv pip install git+https://github.com/Empiria/mnemosyne-cli.git \
+#
+# Cache-bust: `RUN uv pip install git+...` is keyed on the command string, so
+# buildx will reuse a cached layer even when the remote branch advances. The
+# `--build-arg MNEMOSYNE_REV=<commit-sha>` (passed by publish-images.yml as
+# `${{ github.sha }}`) invalidates this layer on every push to mnemosyne-cli/main.
+ARG MNEMOSYNE_REV=unset
+RUN echo "Installing mnemosyne-cli (cache-bust rev=${MNEMOSYNE_REV})" \
+ && uv pip install git+https://github.com/Empiria/mnemosyne-cli.git \
  && test -x /opt/empiria/.venv/bin/mnemosyne \
  && /opt/empiria/.venv/bin/mnemosyne --help >/dev/null
 

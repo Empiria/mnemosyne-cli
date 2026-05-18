@@ -154,6 +154,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BASE_IMAGE=${{ env.REGISTRY }}/${{ env.ORG }}/scion-claude:latest
+            MNEMOSYNE_REV=${{ github.sha }}
           cache-from: type=gha,scope=empiria-claude
           cache-to: type=gha,mode=max,scope=empiria-claude
 
