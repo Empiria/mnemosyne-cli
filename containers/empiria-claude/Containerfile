@@ -87,16 +87,36 @@ RUN echo "Installing mnemosyne-cli (cache-bust rev=${MNEMOSYNE_REV})" \
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
 ENV PATH="/home/scion/.cargo/bin:$PATH"
 
-# Native Claude Code is intentionally NOT installed here. Previous versions
-# of this Containerfile ran `claude install stable` which lands in
-# ~/.local/bin/claude — but SCION's runtime mount overlay at /home/scion
-# masks ~/.local entirely, so the native binary is unreachable inside a
-# live agent. The fallback is the npm-global claude shipped by the
-# scion-claude parent image (at /usr/local/share/npm-global/bin/claude,
-# which is outside the mount). The npm-global claude auto-update writes
-# to its install dir which IS writable; users may see a "couldn't auto-
-# update" warning when the dir isn't writable in some configurations —
-# cosmetic, the binary still works.
+# Claude Code: pin to a known-good npm-global version and disable the auto-
+# updater.
+#
+# Mechanism. The scion-claude parent image installs claude as a root-owned
+# npm-global package at /usr/local/share/npm-global/lib/node_modules/
+# @anthropic-ai/claude-code (npm runs as root at base-image build time).
+# At agent runtime the container runs as the scion user (uid 1000), which
+# lacks write access to that install dir. Claude's auto-updater always
+# fails the writability check and prints "couldn't auto-update" on every
+# start. DISABLE_AUTOUPDATER is the officially-documented Anthropic env
+# var for this case — see https://code.claude.com/docs/en/env-vars.
+#
+# We also re-run `npm install -g @anthropic-ai/claude-code@<pin>` to lock
+# the version explicitly. The scion-claude base ships whatever was current
+# at base-build time; without an explicit pin, transitive `npm install -g`
+# calls in this Containerfile (qmd, ctx7, get-shit-done-cc) can silently
+# upgrade claude. Pinning makes the image's claude version a deliberate
+# planner choice — bump when a security fix lands or a feature we need
+# ships in a newer release. The pin string is the source of truth.
+#
+# CLAUDE_CONFIG_DIR was considered as an alternative (relocate state out
+# of /home/scion mount overlay) but Anthropic's docs are explicit:
+# CLAUDE_CONFIG_DIR scopes to ~/.claude (settings/credentials/sessions),
+# not the binary install dir. It does NOT solve this case.
+USER root
+RUN npm install -g @anthropic-ai/claude-code@2.1.110 \
+ && which claude >/dev/null \
+ && claude --version
+ENV DISABLE_AUTOUPDATER=1
+USER scion
 
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
