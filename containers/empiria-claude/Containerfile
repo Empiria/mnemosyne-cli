@@ -139,6 +139,22 @@ RUN npm install -g get-shit-done-cc \
  && ln -sf /usr/local/share/npm-global/lib/node_modules/get-shit-done-cc/get-shit-done/bin/gsd-tools.cjs /usr/local/share/npm-global/bin/gsd-tools \
  && which gsd-tools >/dev/null
 
+# Community hooks gap. The npm package's installer enables two opt-in
+# SessionStart/PreToolUse hooks in ~/.claude/settings.json that reference
+# gsd-session-state.sh and gsd-validate-commit.sh, but the npm-packaged
+# install does NOT ship those scripts. Result: every claude invocation in
+# a fresh agent errors with "no such file" before the opt-in check inside
+# the hooks can short-circuit (the hooks themselves are no-ops unless
+# .planning/config.json sets hooks.community=true). We ship the scripts
+# from this repo's community-hooks/ directory into a known build-time
+# location at /opt/empiria/community-hooks/; the vault's post-start.sh
+# copies them into the agent's live ~/.claude/hooks/ after the
+# get-shit-done-cc re-install runs. See agents/scion-template/hooks/
+# post-start.sh in the vault for the deposit step. Surfaced during Phase
+# 33.2 UAT — backlog item to upstream into get-shit-done-cc.
+COPY community-hooks/*.sh /opt/empiria/community-hooks/
+RUN chmod +x /opt/empiria/community-hooks/*.sh
+
 # Run as root so sciontool init can chown mounted volumes before dropping
 # to scion. Requires the podman ExecUser fix (scion PR #XX) so the broker
 # execs as scion to find the tmux socket at /tmp/tmux-1000/.
