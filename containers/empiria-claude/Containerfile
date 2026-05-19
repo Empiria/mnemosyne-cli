@@ -152,8 +152,7 @@ RUN npm install -g get-shit-done-cc \
 # get-shit-done-cc re-install runs. See agents/scion-template/hooks/
 # post-start.sh in the vault for the deposit step. Surfaced during Phase
 # 33.2 UAT — backlog item to upstream into get-shit-done-cc.
-COPY community-hooks/*.sh /opt/empiria/community-hooks/
-RUN chmod +x /opt/empiria/community-hooks/*.sh
+COPY --chmod=0755 community-hooks/*.sh /opt/empiria/community-hooks/
 
 # Run as root so sciontool init can chown mounted volumes before dropping
 # to scion. Requires the podman ExecUser fix (scion PR #XX) so the broker
