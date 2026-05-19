@@ -87,37 +87,43 @@ RUN echo "Installing mnemosyne-cli (cache-bust rev=${MNEMOSYNE_REV})" \
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
 ENV PATH="/home/scion/.cargo/bin:$PATH"
 
-# Claude Code: pinned native install + disable background auto-updater.
+# Claude Code: native install tracking the stable channel, scion-writable
+# install dir so the background auto-updater can land new versions in
+# place over the agent's lifetime.
 #
-# Mechanism. The scion-claude parent image installs claude as a root-owned
-# npm-global package. That approach has two failure modes for fresh agents:
-#   1. The npm-global path is owned by root and outside the /home/scion mount
-#      overlay, so the auto-updater's writability check fails and prints
-#      "couldn't auto-update" on every start.
-#   2. claude 2.1.x prints a "switched from npm install to native installation"
-#      migration nag on every interactive startup pointing operators to
-#      https://code.claude.com/docs/en/setup#install-claude-code.
-# The native installer (Anthropic-signed, see https://claude.ai/install.sh)
-# drops both nags. We pin the version by passing it as the install.sh
-# argument; auto-update is still disabled via DISABLE_AUTOUPDATER (works
-# for native installs per the docs — only stops the background check,
-# `claude update`/`claude install` still work).
+# Mechanism. Anthropic's native installer (https://claude.ai/install.sh)
+# writes a versioned layout to $HOME/.local/share/claude/versions/<v>/
+# plus a symlink at $HOME/.local/bin/claude that claude maintains itself
+# on auto-update. We install as the scion user with HOME=/opt/claude so
+# the binary lives outside the /home/scion mount overlay AND is writable
+# by the agent at runtime — when claude detects a new stable release, it
+# writes versions/<new>/ and re-targets /opt/claude/.local/bin/claude to
+# the new version with no operator action required.
 #
-# Layout. install.sh writes the binary to $HOME/.local/share/claude/
-# versions/<pin>; at build time $HOME=/root so we move it to /opt/claude/
-# (system-wide, scion-readable) and symlink /usr/local/bin/claude into it.
-# The /opt path survives the SCION /home/scion mount overlay; the npm
-# install dir at /usr/local/share/npm-global/ does the same, but the
-# native binary doesn't need an updater-writable parent.
+# Channel: passing `stable` to install.sh tracks the stable release
+# channel (typically one week behind latest, skipping releases with
+# major regressions per Anthropic docs). The canonical .claude.json
+# seed sets autoUpdatesChannel:"stable" so subsequent auto-updates
+# also follow stable.
+#
+# History: an earlier Plan 33.2-03 iteration pinned a specific version
+# (2.1.110) with DISABLE_AUTOUPDATER=1, justified by the npm-global
+# installer's broken writability behavior. That rationale dissolved
+# once we migrated off npm-global to the native installer (fdb7271);
+# the only remaining argument for pinning was build determinism, which
+# we trade for host parity here (host auto-updates too). Build-time
+# image freshness is still deterministic per CI run (stable resolves
+# to whatever stable is when the CI build fires).
 USER root
-RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.110 \
- && mv /root/.local/share/claude /opt/claude \
- && rm -f /root/.local/bin/claude \
- && npm uninstall -g @anthropic-ai/claude-code \
- && ln -sf /opt/claude/versions/2.1.110 /usr/local/bin/claude \
- && /usr/local/bin/claude --version \
- && test "$(command -v claude)" = "/usr/local/bin/claude"
-ENV DISABLE_AUTOUPDATER=1
+RUN mkdir -p /opt/claude \
+ && chown -R scion:scion /opt/claude \
+ && npm uninstall -g @anthropic-ai/claude-code
+USER scion
+RUN HOME=/opt/claude curl -fsSL https://claude.ai/install.sh | bash -s stable \
+ && /opt/claude/.local/bin/claude --version
+USER root
+ENV PATH="/opt/claude/.local/bin:$PATH"
+RUN test "$(command -v claude)" = "/opt/claude/.local/bin/claude"
 USER scion
 
 # Pre-create dep-cache subdirs so named volume is agent-owned on first mount
