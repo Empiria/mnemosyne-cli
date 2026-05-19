@@ -119,8 +119,11 @@ RUN mkdir -p /opt/claude \
  && chown -R scion:scion /opt/claude \
  && npm uninstall -g @anthropic-ai/claude-code
 USER scion
-RUN HOME=/opt/claude curl -fsSL https://claude.ai/install.sh | bash -s stable \
- && /opt/claude/.local/bin/claude --version
+# `HOME=… curl … | bash` only sets HOME for curl — the piped bash inherits
+# the shell environment, so install.sh would see HOME=/home/scion and put
+# the binary outside /opt/claude. `env HOME=… bash -c …` propagates HOME
+# to the bash that actually runs install.sh.
+RUN env HOME=/opt/claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash -s stable && /opt/claude/.local/bin/claude --version'
 USER root
 ENV PATH="/opt/claude/.local/bin:$PATH"
 RUN test "$(command -v claude)" = "/opt/claude/.local/bin/claude"
