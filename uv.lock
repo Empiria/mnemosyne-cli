@@ -79,6 +79,7 @@ name = "mnemosyne-cli"
 version = "0.5.0"
 source = { editable = "." }
 dependencies = [
+    { name = "packaging" },
     { name = "python-frontmatter" },
     { name = "tomli-w" },
     { name = "typer" },
@@ -91,6 +92,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "packaging", specifier = ">=21.0" },
     { name = "python-frontmatter", specifier = ">=1.1.0" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "typer", specifier = ">=0.24.1" },
