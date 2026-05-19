@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 import typer
+from packaging.version import Version
 from rich.console import Console
 
 from mnemosyne_cli.lib import checks as lib_checks
@@ -1302,7 +1304,100 @@ def _build_checks(
                     )
                 )
 
+    # --- Category: Claude Onboarding Drift (SBR-2.2, D-08/D-09/D-10) ---
+    # Compare SCION harness-config template's lastOnboardingVersion against
+    # the host's ~/.claude.json. Drift means fresh agents will re-run
+    # onboarding. Sibling to the SCION Template Freshness category — different
+    # inputs (host JSON, not broker cache), different reset command
+    # (scion harness-config reset, not scion template sync). Host-side only;
+    # the in-container variant of this check is deferred (CONTEXT "NOT in
+    # this phase" item 6).
+    if not container:
+        checks.append(
+            Check(
+                name="Claude onboarding-version drift",
+                category="Claude Onboarding Drift",
+                _check_fn=_check_claude_onboarding_drift,
+            )
+        )
+
     return checks
+
+
+def _check_claude_onboarding_drift() -> CheckResult:
+    """SBR-2.2 / D-08 / D-09 / D-10: compare SCION harness-config template's
+    lastOnboardingVersion against the host's ~/.claude.json.
+
+    Reads ~/.scion/harness-configs/claude/home/.claude.json (template) and
+    ~/.claude.json (host). Drift (template < host) means fresh agents will
+    re-run onboarding pages.
+
+    Pure read; no _fix_fn attached (Phase 33.1 D-21 — doctor read-only in 33.x).
+    Skipped (with context) when host has not run claude yet (D-10) or when
+    the SCION harness-config template has not been seeded on this machine.
+    """
+    template_path = Path.home() / ".scion" / "harness-configs" / "claude" / "home" / ".claude.json"
+    host_path = Path.home() / ".claude.json"
+
+    if not template_path.exists():
+        return CheckResult(
+            ok=True,
+            message=(
+                "SCION claude harness-config template not seeded on this machine — "
+                "run `scion init --machine` then apply the Empiria seed (see "
+                "agents/scion-template/claude-harness-config/README.md)."
+            ),
+        )
+    if not host_path.exists():
+        return CheckResult(
+            ok=True,
+            message=(
+                "Host Claude has not run on this machine — drift can't be assessed. "
+                "Run `claude` once on the host then re-run doctor."
+            ),
+        )
+
+    try:
+        template_data = json.loads(template_path.read_text())
+        host_data = json.loads(host_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        return CheckResult(
+            ok=False,
+            message=f"Could not read claude config: {exc}",
+        )
+
+    template_ver = template_data.get("lastOnboardingVersion")
+    host_ver = host_data.get("lastOnboardingVersion")
+
+    if not template_ver or not host_ver:
+        return CheckResult(
+            ok=False,
+            message=(
+                f"Missing lastOnboardingVersion field — "
+                f"template={template_ver!r}, host={host_ver!r}"
+            ),
+        )
+
+    if Version(template_ver) < Version(host_ver):
+        return CheckResult(
+            ok=False,
+            message=(
+                f"Onboarding drift: template={template_ver}, host={host_ver}. "
+                f"Fresh agents will re-run onboarding."
+            ),
+            fix_cmd=(
+                f"Edit ~/.scion/harness-configs/claude/home/.claude.json — "
+                f"set lastOnboardingVersion to {host_ver!r} and lastReleaseNotesSeen "
+                f"to match, then `scion harness-config reset claude && "
+                f"rm -rf ~/.scion/cache/templates && systemctl --user restart "
+                f"scion-broker`. See agents/scion-template/claude-harness-config/README.md."
+            ),
+        )
+
+    return CheckResult(
+        ok=True,
+        message=f"template={template_ver} ≥ host={host_ver}",
+    )
 
 
 def _components_apply_here(cwd: Path, vault_path: Path) -> bool:
