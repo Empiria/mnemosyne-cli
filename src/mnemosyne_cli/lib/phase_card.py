@@ -651,7 +651,7 @@ def apply_event(card: PhaseCard, event: str, reason: str | None = None) -> Phase
     raise AssertionError(f"unreachable: {event}")
 
 
-_PHASE_DIR_PREFIX_RE = re.compile(r"^(\d+(?:-\d+)?|empiria-\d+)-")
+_PHASE_DIR_PREFIX_RE = re.compile(r"^(\d+(?:[.-]\d+)?|empiria-\d+)-")
 
 
 def resolve_phase_dir(vault: Path, phase_id: str, project: str | None = None) -> Path | None:
@@ -667,7 +667,15 @@ def resolve_phase_dir(vault: Path, phase_id: str, project: str | None = None) ->
     Path traversal mitigation (T-37-01 carry-forward): reject project containing
     '..' or starting with '/'.
     """
-    phase_dir_prefix = phase_id.replace(".", "-")
+    # D-06: try both dot-form and hyphen-form. dot-form is the canonical
+    # Phase 37 representation; hyphen-form is the legacy infinite-worlds
+    # convention (e.g. 195-02-decimal-sub).
+    # first-match-wins; ambiguous (≥2 candidates across both forms) → None.
+    dot_form = phase_id  # e.g. '33.1' or '195.02'
+    hyphen_form = phase_id.replace(".", "-")  # e.g. '33-1' or '195-02'
+
+    # If the phase_id has no dot, both forms collapse — single glob.
+    prefixes = [dot_form] if dot_form == hyphen_form else [dot_form, hyphen_form]
 
     if project is not None:
         if ".." in project or project.startswith("/"):
@@ -680,18 +688,24 @@ def resolve_phase_dir(vault: Path, phase_id: str, project: str | None = None) ->
         search_root = validated / "gsd-planning" / "phases"
         if not search_root.is_dir():
             return None
-        candidates = [
-            d for d in search_root.iterdir()
-            if d.is_dir() and d.name.startswith(phase_dir_prefix + "-")
-        ]
+        candidates: list[Path] = []
+        for prefix in prefixes:
+            for d in search_root.iterdir():
+                if d.is_dir() and d.name.startswith(prefix + "-"):
+                    candidates.append(d)
     else:
-        candidates = [
-            c for c in vault.glob(f"projects/*/*/gsd-planning/phases/{phase_dir_prefix}-*")
-            if c.is_dir()
-        ]
+        candidates = []
+        for prefix in prefixes:
+            for c in vault.glob(f"projects/*/*/gsd-planning/phases/{prefix}-*"):
+                if c.is_dir():
+                    candidates.append(c)
 
-    if len(candidates) == 1:
-        return candidates[0]
+    # De-duplicate by path — a dir matching both prefixes (impossible in practice
+    # since dot ≠ hyphen, but defensive) would otherwise show up twice.
+    unique = list({c.resolve(): c for c in candidates}.values())
+
+    if len(unique) == 1:
+        return unique[0]
     return None  # 0 or >=2 — caller decides (D-08: silent skip)
 
 
