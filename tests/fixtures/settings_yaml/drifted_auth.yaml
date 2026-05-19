@@ -1,0 +1,6 @@
+harness_configs:
+  claude:
+    auth_selected_type: auth-file
+profiles:
+  local:
+    env: {}

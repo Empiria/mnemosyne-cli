@@ -1,0 +1,2 @@
+default_template: empiria-agent
+default_harness_config: claude
