@@ -81,6 +81,7 @@ source = { editable = "." }
 dependencies = [
     { name = "packaging" },
     { name = "python-frontmatter" },
+    { name = "pyyaml" },
     { name = "tomli-w" },
     { name = "typer" },
 ]
@@ -94,6 +95,7 @@ dev = [
 requires-dist = [
     { name = "packaging", specifier = ">=21.0" },
     { name = "python-frontmatter", specifier = ">=1.1.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "typer", specifier = ">=0.24.1" },
 ]

@@ -8,6 +8,7 @@ dependencies = [
     "tomli-w>=1.0",
     "python-frontmatter>=1.1.0",
     "packaging>=21.0",
+    "PyYAML>=6.0",
 ]
 
 [project.scripts]
