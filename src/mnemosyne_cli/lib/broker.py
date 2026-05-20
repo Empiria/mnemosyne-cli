@@ -507,7 +507,7 @@ def apply_empiria_defaults(dry_run: bool = False) -> OverlayResult:
     (caller maps to typer.Exit). RESEARCH Pitfall 5.
 
     Field-level merge for user settings.yaml (multiple harness types may coexist).
-    Whole-file overwrite for grove settings.yaml (single-purpose, Empiria-owned).
+    Field-level merge for grove settings.yaml (only the two Empiria-managed keys are changed).
     Idempotent — re-run on already-canonical state returns an empty (falsy) result.
     """
     import yaml

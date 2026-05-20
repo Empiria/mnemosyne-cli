@@ -183,10 +183,12 @@ def apply_empiria_defaults_cmd(
 ) -> None:
     """Write canonical Empiria settings to user, grove, and harness-config surfaces.
 
-    Phase 33.3 SBR-3.7 tier-2. Idempotent and overwrite-on-mismatch (D-32).
-    For grove settings.yaml: writes the whole file. For user settings.yaml:
-    field-level merge (only fields Empiria manages — auth_selected_type, profile
-    env). Comments and unrelated keys in grove files are not preserved (D-32).
+    Phase 33.3 SBR-3.7 tier-2. Idempotent and overwrite-on-mismatch.
+    Both user and grove settings.yaml use a field-level merge — only the fields
+    Empiria manages are changed (auth_selected_type and profile env for user;
+    default_template and default_harness_config for groves); all other operator-
+    configured keys are preserved. Note: YAML comments are not preserved through a
+    load/dump round-trip.
 
     Pre-flight: requires ~/.scion/settings.yaml to exist (run `scion init` first).
     """
