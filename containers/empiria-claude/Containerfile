@@ -33,10 +33,17 @@ RUN npm install -g @tobilu/qmd && \
         rm -rf "$NPM_PREFIX/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-x64"*; \
     else \
         rm -rf "$NPM_PREFIX/lib/node_modules/@tobilu/qmd/node_modules/@node-llama-cpp/linux-arm"*; \
-    fi
+    fi && \
+    npm cache clean --force
+
+# Playwright drop (D-11 / SBR-3.2-PLAYWRIGHT): NO-OP confirmed.
+# Phase 33.3 RESEARCH verified via `podman run --rm <image> which playwright`
+# that playwright is NOT present in either scion-claude base or this layer.
+# If a future scion-claude base ships playwright, add an explicit removal here.
+# Verified: 2026-05-19 — playwright/, /usr/bin/playwright, /opt/playwright NOTFOUND.
 
 # ctx7: library documentation lookup
-RUN npm install -g ctx7
+RUN npm install -g ctx7 && npm cache clean --force
 
 # Empiria install root that survives SCION's runtime mount overlay of /home/scion.
 # The broker bind-mounts <grove>/agents/<agent>/home:/home/scion at agent start,
@@ -81,7 +88,9 @@ ARG MNEMOSYNE_REV=unset
 RUN echo "Installing mnemosyne-cli (cache-bust rev=${MNEMOSYNE_REV})" \
  && uv pip install git+https://github.com/Empiria/mnemosyne-cli.git \
  && test -x /opt/empiria/.venv/bin/mnemosyne \
- && /opt/empiria/.venv/bin/mnemosyne --help >/dev/null
+ && /opt/empiria/.venv/bin/mnemosyne --help >/dev/null \
+ && find /opt/empiria/.venv -name "*.pyc" -delete \
+ && find /opt/empiria/.venv -name "__pycache__" -type d -exec rm -rf {} +
 
 # rustup: Rust toolchain for cargo dependencies
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
@@ -117,7 +126,8 @@ ENV PATH="/home/scion/.cargo/bin:$PATH"
 USER root
 RUN mkdir -p /opt/claude \
  && chown -R scion:scion /opt/claude \
- && npm uninstall -g @anthropic-ai/claude-code
+ && npm uninstall -g @anthropic-ai/claude-code \
+ && npm cache clean --force
 USER scion
 # `HOME=… curl … | bash` only sets HOME for curl — the piped bash inherits
 # the shell environment, so install.sh would see HOME=/home/scion and put
@@ -146,7 +156,8 @@ RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
 RUN npm install -g get-shit-done-cc \
  && get-shit-done-cc --claude --global \
  && ln -sf /usr/local/share/npm-global/lib/node_modules/get-shit-done-cc/get-shit-done/bin/gsd-tools.cjs /usr/local/share/npm-global/bin/gsd-tools \
- && which gsd-tools >/dev/null
+ && which gsd-tools >/dev/null \
+ && npm cache clean --force
 
 # Community hooks gap. The npm package's installer enables two opt-in
 # SessionStart/PreToolUse hooks in ~/.claude/settings.json that reference
