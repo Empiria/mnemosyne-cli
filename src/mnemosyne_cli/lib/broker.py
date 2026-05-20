@@ -521,3 +521,109 @@ def apply_empiria_defaults(dry_run: bool = False) -> OverlayResult:
         pass
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# SBR-3.3: Broker control-channel health (Phase 33.3)
+# ---------------------------------------------------------------------------
+
+import json as _json  # noqa: E402 — keep SBR-3.3 block self-contained
+import socket  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+BROKER_HEARTBEAT_STALE_THRESHOLD = timedelta(seconds=120)
+
+
+def _resolve_broker_name() -> str:
+    """Resolve this host's broker name as registered with the hub.
+
+    Per RESEARCH Assumption A7: SCION returns brokers with `name` field set
+    to hostname for this host. If operators registered with a custom name,
+    socket.gethostname() may not match — surface this as "broker not
+    registered" rather than masquerade as healthy.
+    """
+    return socket.gethostname()
+
+
+def check_control_channel() -> "CheckResult":
+    """Query `scion hub brokers --json` and assess this broker's health.
+
+    Returns CheckResult(ok=True) when healthy, ok=False when stale/disconnected
+    /not-registered/hub-unreachable.
+
+    Returns ok=True with message "scion CLI not present" when scion is not
+    installed (greenfield host — let install proceed). Per RESEARCH SBR-3.3
+    refinement: this uses `scion hub brokers --json` (NOT log-tail grep) so the
+    same helper backs both the doctor check (tier-1) and the Path-unit watchdog
+    (tier-2), avoiding RESEARCH Pitfall 1 (restart-loop on already-healed
+    broken-pipe log events).
+    """
+    from mnemosyne_cli.lib.symlinks import CheckResult  # avoid cycle
+
+    try:
+        proc = subprocess.run(
+            ["scion", "hub", "brokers", "--json"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+            text=True,
+        )
+    except FileNotFoundError:
+        return CheckResult(
+            ok=True, message="scion CLI not present — broker check skipped"
+        )
+    except subprocess.TimeoutExpired:
+        return CheckResult(
+            ok=False, message="Hub unreachable (scion hub brokers timed out)"
+        )
+    except subprocess.CalledProcessError as e:
+        return CheckResult(ok=False, message=f"Could not query hub: {e}")
+
+    try:
+        brokers = _json.loads(proc.stdout)
+    except _json.JSONDecodeError as e:
+        return CheckResult(ok=False, message=f"Hub returned unparseable JSON: {e}")
+
+    this_host = _resolve_broker_name()
+    me = next(
+        (b for b in brokers if b.get("name") == this_host), None
+    ) if isinstance(brokers, list) else None
+    if me is None:
+        return CheckResult(
+            ok=False,
+            message=f"This host ({this_host}) not registered as a broker on the hub",
+        )
+
+    state = me.get("connectionState")
+    status = me.get("status")
+    last_hb_iso = me.get("lastHeartbeat")
+    if not last_hb_iso:
+        return CheckResult(
+            ok=False, message=f"Broker {this_host}: no lastHeartbeat field"
+        )
+    try:
+        last_hb = datetime.fromisoformat(str(last_hb_iso).replace("Z", "+00:00"))
+    except ValueError:
+        return CheckResult(
+            ok=False,
+            message=f"Broker {this_host}: malformed lastHeartbeat={last_hb_iso}",
+        )
+
+    age = datetime.now(timezone.utc) - last_hb
+    if (
+        state != "connected"
+        or status != "online"
+        or age > BROKER_HEARTBEAT_STALE_THRESHOLD
+    ):
+        return CheckResult(
+            ok=False,
+            message=(
+                f"Broker {this_host}: state={state}, status={status}, "
+                f"lastHeartbeat={int(age.total_seconds())}s ago"
+            ),
+            fix_cmd="systemctl --user restart scion-broker",
+        )
+    return CheckResult(
+        ok=True,
+        message=f"Broker {this_host} healthy (lastHeartbeat {int(age.total_seconds())}s ago)",
+    )
