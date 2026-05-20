@@ -695,19 +695,31 @@ def uninstall_path_unit_watchdog() -> list[Path]:
 
     for unit_name in (PATH_UNIT_NAME, RESTART_SERVICE_NAME):
         unit_path = unit_dir / unit_name
+        # Skip hosts that never had the defective watchdog. Running systemctl
+        # reset-failed on a non-existent unit prints spurious error noise to
+        # stderr; capture_output suppresses it on the rare host that does have
+        # a stale unit to clean up.
+        if not unit_path.exists():
+            continue
         subprocess.run(
             ["systemctl", "--user", "disable", "--now", unit_name],
             check=False,
+            capture_output=True,
         )
         subprocess.run(
             ["systemctl", "--user", "reset-failed", unit_name],
             check=False,
+            capture_output=True,
         )
-        if unit_path.exists():
-            unit_path.unlink()
-            removed.append(unit_path)
+        unit_path.unlink()
+        removed.append(unit_path)
 
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    if removed:
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=False,
+            capture_output=True,
+        )
     return removed
 
 
