@@ -1,8 +1,74 @@
-# Empiria capability image for SCION agents
-# Extends scion-claude with qmd, ctx7, uv, gh, ripgrep
+# Empiria capability image for SCION agents (Phase 33.3 SBR-3.2 tier-2)
+# Extends scion-claude with qmd, ctx7, uv, gh, ripgrep.
+#
+# Multi-stage build: the builder stage carries the rustup toolchain (~1.5 GiB)
+# needed only to compile native Python wheels at install time; the runtime
+# stage receives just the compiled artefacts under /opt/empiria via
+# COPY --from=builder and never installs rustup. Combined with Plan 01's
+# tier-1 cleanup this targets the D-10 acceptance bar of < 4 GiB.
 ARG BASE_IMAGE=scion-claude:latest
+
+# ============================================================================
+# Stage 1: builder — has rustup, uv, network for compilation.
+# Nothing from this stage ships except /opt/empiria (COPY'd into runtime).
+# ============================================================================
+FROM ${BASE_IMAGE} AS builder
+ARG TARGETARCH
+# ARG MNEMOSYNE_REV declared IN THIS STAGE per RESEARCH Pitfall 4 — multi-stage
+# builds keep an independent layer cache per stage, so the cache-bust ARG must
+# be re-declared here or the mnemosyne-cli install layer stays warm even when
+# the remote branch advances.
+ARG MNEMOSYNE_REV=unset
+USER root
+
+# rustup: Rust toolchain for compiling native Python wheels. Build-time ONLY —
+# the runtime stage never sees this; only the compiled wheels in
+# /opt/empiria/.venv survive into the runtime image.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# uv installer (build-stage uv produces the venv that the runtime stage
+# receives via COPY --from=builder; runtime re-installs its own small uv
+# binary separately for project container.toml deps).
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Empiria install root + Python interpreter + venv. All destined for
+# /opt/empiria which is COPY'd verbatim into the runtime stage. /opt/empiria
+# (not /home/scion) survives SCION's runtime mount overlay of /home/scion
+# (Phase 33.1 Plan 33.1-05 finding).
+RUN mkdir -p /opt/empiria
+# UV_PYTHON_INSTALL_DIR redirects the interpreter under /opt/empiria so the
+# venv's `python` symlink stays valid after the COPY into runtime.
+ENV UV_PYTHON_INSTALL_DIR=/opt/empiria/python
+RUN uv python install 3.13
+RUN uv venv /opt/empiria/.venv
+ENV VIRTUAL_ENV="/opt/empiria/.venv"
+
+# mnemosyne CLI: vault operational commands.
+# uv pip can exit 0 with a partial install under network flakiness; the
+# `test -x` + `--help` guard fails the build if the binary did not materialise.
+# .pyc / __pycache__ are stripped here (in the builder) so the COPY'd
+# /opt/empiria carries no build-cache cruft into the runtime image.
+RUN echo "Installing mnemosyne-cli (cache-bust rev=${MNEMOSYNE_REV})" \
+ && uv pip install git+https://github.com/Empiria/mnemosyne-cli.git \
+ && test -x /opt/empiria/.venv/bin/mnemosyne \
+ && /opt/empiria/.venv/bin/mnemosyne --help >/dev/null \
+ && find /opt/empiria/.venv -name "*.pyc" -delete \
+ && find /opt/empiria/.venv -name "__pycache__" -type d -exec rm -rf {} +
+
+# Chown so the runtime stage's COPY preserves scion-owned permissions.
+# (Runtime re-chowns as belt-and-braces; this is for the COPY semantics.)
+RUN chown -R 1000:1000 /opt/empiria
+
+# ============================================================================
+# Stage 2: runtime — slim image, NO rustup. Inherits everything else from
+# scion-claude:latest; receives only /opt/empiria from the builder stage.
+# ============================================================================
 FROM ${BASE_IMAGE}
 ARG TARGETARCH
+# ARG MNEMOSYNE_REV re-declared per RESEARCH Pitfall 4 (per-stage cache).
+ARG MNEMOSYNE_REV=unset
 USER root
 
 # GitHub CLI + ripgrep
@@ -23,6 +89,15 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
         apt-get install -y --no-install-recommends cuda-cudart-13-0 libcublas-13-0 && \
         rm -rf /var/lib/apt/lists/*; \
     fi
+
+# ----- COPY artifacts from builder -----
+# /opt/empiria carries: the Python 3.13 interpreter, the venv with mnemosyne-cli
+# installed, .pyc/__pycache__ already stripped. The rustup toolchain that
+# produced the native wheels stays in the builder stage and is NOT copied.
+# /opt/empiria (not /home/scion) survives SCION's runtime mount overlay of
+# /home/scion (Phase 33.1 Plan 33.1-05 finding).
+COPY --from=builder /opt/empiria /opt/empiria
+RUN chown -R scion:scion /opt/empiria
 
 # qmd: semantic vault search (install + strip unused platform binaries)
 RUN npm install -g @tobilu/qmd && \
@@ -45,56 +120,29 @@ RUN npm install -g @tobilu/qmd && \
 # ctx7: library documentation lookup
 RUN npm install -g ctx7 && npm cache clean --force
 
-# Empiria install root that survives SCION's runtime mount overlay of /home/scion.
-# The broker bind-mounts <grove>/agents/<agent>/home:/home/scion at agent start,
-# which clobbers anything installed under /home/scion (Phase 33.1 Plan 33.1-05
-# finding). Tools that must be available inside a SCION agent are installed under
-# /opt/empiria/ instead.
-USER root
-RUN mkdir -p /opt/empiria && chown scion:scion /opt/empiria
 USER scion
 
 # Pre-create qmd cache dir so volume mounts don't make it root-owned
 RUN mkdir -p ~/.cache/qmd
 
-# uv + Python: managed environment. uv installer goes to ~/.local/bin (build-time
-# only — not used at runtime inside SCION agents). The persistent venv AND the
-# Python interpreter it points at live under /opt/empiria/ so neither survives
-# the SCION /home/scion mount overlay.
+# uv binary: managed environment. uv is re-installed in the runtime stage
+# (small ~30 MB binary) because the entrypoint uses it for project container.toml
+# deps. The persistent venv AND the Python interpreter it points at arrive from
+# the builder stage under /opt/empiria so neither survives the SCION /home/scion
+# mount overlay.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/home/scion/.local/bin:$PATH"
-# UV_PYTHON_INSTALL_DIR controls where `uv python install` materialises the
-# interpreter. Default is ~/.local/share/uv/python (lives under /home/scion);
-# we redirect it to /opt/empiria so the venv's `python` symlink stays valid
-# at agent runtime.
+
+# Reset env paths to point at the COPY'd venv. UV_PYTHON_INSTALL_DIR keeps
+# `uv python` consistent with the interpreter materialised by the builder.
 ENV UV_PYTHON_INSTALL_DIR=/opt/empiria/python
-RUN uv python install 3.13
-RUN uv venv /opt/empiria/.venv
 ENV VIRTUAL_ENV="/opt/empiria/.venv"
 ENV PATH="/opt/empiria/.venv/bin:$PATH"
 
-# mnemosyne CLI: vault operational commands.
-# uv pip can exit 0 with a partial install under network flakiness; the
-# `test -x` + `--help` guard fails the build if the binary did not materialise.
-# Surfaces silent install regressions at CI time, not after agent start.
-# Installed to /opt/empiria/.venv/bin/mnemosyne (NOT /home/scion/.venv/...) so the
-# binary survives SCION's home-directory mount overlay.
-#
-# Cache-bust: `RUN uv pip install git+...` is keyed on the command string, so
-# buildx will reuse a cached layer even when the remote branch advances. The
-# `--build-arg MNEMOSYNE_REV=<commit-sha>` (passed by publish-images.yml as
-# `${{ github.sha }}`) invalidates this layer on every push to mnemosyne-cli/main.
-ARG MNEMOSYNE_REV=unset
-RUN echo "Installing mnemosyne-cli (cache-bust rev=${MNEMOSYNE_REV})" \
- && uv pip install git+https://github.com/Empiria/mnemosyne-cli.git \
- && test -x /opt/empiria/.venv/bin/mnemosyne \
- && /opt/empiria/.venv/bin/mnemosyne --help >/dev/null \
- && find /opt/empiria/.venv -name "*.pyc" -delete \
- && find /opt/empiria/.venv -name "__pycache__" -type d -exec rm -rf {} +
-
-# rustup: Rust toolchain for cargo dependencies
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-ENV PATH="/home/scion/.cargo/bin:$PATH"
+# Sanity check that the COPY'd mnemosyne-cli is still functional after the
+# stage boundary — fails the build if the multi-stage COPY dropped anything.
+RUN test -x /opt/empiria/.venv/bin/mnemosyne \
+ && /opt/empiria/.venv/bin/mnemosyne --help >/dev/null
 
 # Claude Code: native install tracking the stable channel, scion-writable
 # install dir so the background auto-updater can land new versions in
