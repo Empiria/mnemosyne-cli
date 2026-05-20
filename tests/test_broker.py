@@ -389,12 +389,12 @@ def test_apply_empiria_defaults_cmd_exits_when_settings_missing(
 
 
 # ---------------------------------------------------------------------------
-# Phase 33.3 — Task 04.1 check-control-channel verb exit-code matrix (D-38)
+# Phase 33.3 — check-control-channel read-only diagnostic tests (gap-closure 08)
 # ---------------------------------------------------------------------------
 
 
 def test_check_control_channel_verb_passes(monkeypatch, capsys):
-    """PASS check -> exit 0, no restart attempted."""
+    """PASS check -> exit 0."""
     from mnemosyne_cli.commands import broker as broker_cmd
     from mnemosyne_cli.lib import broker as broker_lib
     from mnemosyne_cli.lib.symlinks import CheckResult
@@ -405,13 +405,13 @@ def test_check_control_channel_verb_passes(monkeypatch, capsys):
         lambda: CheckResult(ok=True, message="healthy"),
     )
     # Should NOT raise typer.Exit.
-    broker_cmd.check_control_channel_cmd(restart_if_stale=False)
+    broker_cmd.check_control_channel_cmd()
     out = capsys.readouterr().out
     assert "ok" in out and "healthy" in out
 
 
 def test_check_control_channel_verb_fail_diagnostic_mode_exits_1(monkeypatch):
-    """FAIL check without --restart-if-stale -> exit 1 (diagnostic mode)."""
+    """FAIL check -> exit 1 (read-only diagnostic mode)."""
     from mnemosyne_cli.commands import broker as broker_cmd
     from mnemosyne_cli.lib import broker as broker_lib
     from mnemosyne_cli.lib.symlinks import CheckResult
@@ -422,109 +422,45 @@ def test_check_control_channel_verb_fail_diagnostic_mode_exits_1(monkeypatch):
         lambda: CheckResult(ok=False, message="stale"),
     )
     with pytest.raises(typer.Exit) as exc:
-        broker_cmd.check_control_channel_cmd(restart_if_stale=False)
-    assert exc.value.exit_code == 1
-
-
-def test_check_control_channel_verb_successful_restart_exits_0(monkeypatch, capsys):
-    """FAIL check + --restart-if-stale + restart returncode 0 -> exit 0 (per D-38).
-
-    This is the CRITICAL test: successful auto-recovery MUST NOT raise typer.Exit,
-    otherwise the systemd Path-unit would record a failed trigger and burn a
-    StartLimitBurst slot on every successful recovery, deactivating the watchdog
-    after 5 recoveries in 10 minutes.
-    """
-    from mnemosyne_cli.commands import broker as broker_cmd
-    from mnemosyne_cli.lib import broker as broker_lib
-    from mnemosyne_cli.lib.symlinks import CheckResult
-
-    monkeypatch.setattr(
-        broker_lib,
-        "check_control_channel",
-        lambda: CheckResult(ok=False, message="stale", fix_cmd=""),
-    )
-
-    class _OkProc:
-        returncode = 0
-
-    calls = []
-
-    def _spy(cmd, *a, **k):
-        calls.append(cmd)
-        return _OkProc()
-
-    monkeypatch.setattr("subprocess.run", _spy)
-
-    # Should NOT raise typer.Exit — exit 0 path.
-    broker_cmd.check_control_channel_cmd(restart_if_stale=True)
-    assert any(
-        "systemctl" in c and "restart" in c for c in calls
-    ), "restart subprocess must be invoked"
-    out = capsys.readouterr().out
-    assert "successfully" in out
-
-
-def test_check_control_channel_verb_failed_restart_exits_1(monkeypatch):
-    """FAIL check + --restart-if-stale + restart returncode != 0 -> exit 1.
-
-    Genuine restart failure (e.g., systemd refuses, unit masked) legitimately
-    consumes a StartLimitBurst slot.
-    """
-    from mnemosyne_cli.commands import broker as broker_cmd
-    from mnemosyne_cli.lib import broker as broker_lib
-    from mnemosyne_cli.lib.symlinks import CheckResult
-
-    monkeypatch.setattr(
-        broker_lib,
-        "check_control_channel",
-        lambda: CheckResult(ok=False, message="stale", fix_cmd=""),
-    )
-
-    class _FailProc:
-        returncode = 5
-
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: _FailProc())
-
-    with pytest.raises(typer.Exit) as exc:
-        broker_cmd.check_control_channel_cmd(restart_if_stale=True)
+        broker_cmd.check_control_channel_cmd()
     assert exc.value.exit_code == 1
 
 
 # ---------------------------------------------------------------------------
-# Phase 33.3 — Task 04.2a Path-unit watchdog emission
+# Phase 33.3 — gap-closure 08: uninstall_path_unit_watchdog idempotency
 # ---------------------------------------------------------------------------
 
 
-def test_install_writes_pathunit(tmp_path, monkeypatch):
-    """SBR-3.3 D-17: install_path_unit_watchdog writes both unit files."""
+def test_uninstall_path_unit_watchdog_is_idempotent(tmp_path, monkeypatch):
+    """uninstall_path_unit_watchdog is safe to call when no units exist (returns []).
+
+    Also verifies that when stale unit files ARE present they are removed and
+    their paths returned.
+    """
     from mnemosyne_cli.lib import broker
 
-    mb = tmp_path / "mnemosyne"
-    mb.write_text("#!/bin/sh\n")
-    mb.chmod(0o755)
-    monkeypatch.setattr(broker, "_find_mnemosyne_bin", lambda: mb)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    # Suppress systemctl calls.
+    # Suppress all systemctl calls (check=False already, but monkeypatch is safer).
     monkeypatch.setattr(
         "subprocess.run", lambda *a, **k: type("X", (), {"returncode": 0})()
     )
-    units = broker.install_path_unit_watchdog()
+
+    # First call: no unit files exist — must return empty list, must not raise.
+    result = broker.uninstall_path_unit_watchdog()
+    assert result == [], f"Expected [], got {result}"
+
+    # Second call: plant dummy unit files, then uninstall should remove them.
     unit_dir = tmp_path / ".config" / "systemd" / "user"
-    assert (unit_dir / "scion-broker-control-channel-watchdog.path").exists()
-    assert (unit_dir / "scion-broker-restart-on-broken-pipe.service").exists()
-    svc_text = (
-        unit_dir / "scion-broker-restart-on-broken-pipe.service"
-    ).read_text()
-    assert "StartLimitBurst=5" in svc_text
-    assert "StartLimitIntervalSec=600" in svc_text
-    assert (
-        f"ExecStart={mb} broker check-control-channel --restart-if-stale"
-        in svc_text
-    )
-    assert set(units) == {
-        "scion-broker-control-channel-watchdog.path",
-        "scion-broker-restart-on-broken-pipe.service",
-    }
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    path_unit = unit_dir / broker.PATH_UNIT_NAME
+    svc_unit = unit_dir / broker.RESTART_SERVICE_NAME
+    path_unit.write_text("[Path]\nPathModified=/tmp/fake.log\n")
+    svc_unit.write_text("[Service]\nType=oneshot\n")
+
+    result = broker.uninstall_path_unit_watchdog()
+    assert set(result) == {path_unit, svc_unit}, f"Unexpected removed set: {result}"
+    assert not path_unit.exists(), "path unit file should have been deleted"
+    assert not svc_unit.exists(), "service unit file should have been deleted"
 
 
 # ---------------------------------------------------------------------------
