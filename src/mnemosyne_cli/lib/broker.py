@@ -221,3 +221,21 @@ def _sync_launchd_plist(path: Path, vault_host: Path) -> bool:
     with path.open("wb") as f:
         plistlib.dump(data, f)
     return True
+
+
+# ---------------------------------------------------------------------------
+# YAML / settings.yaml helpers (Phase 33.3 SBR-3.7)
+# ---------------------------------------------------------------------------
+
+
+def yaml_safe_load_or_none(path: Path) -> dict | None:
+    """Read YAML file; return {} for empty, dict for parsed, raise YAMLError on bad input.
+
+    Returns None if the file does not exist (caller decides whether that is WARN or PASS).
+    """
+    import yaml
+
+    if not path.exists():
+        return None
+    text = path.read_text()
+    return yaml.safe_load(text) or {}

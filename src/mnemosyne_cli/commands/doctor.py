@@ -1321,6 +1321,34 @@ def _build_checks(
             )
         )
 
+    # --- Category: Operator State Drift (SBR-3.7, D-29 a/b/c) ---
+    # Host-side only, read-only (D-21 inherited — no _fix_fn). Surfaces the
+    # three operator-state drift classes that 33.2 UAT discovered late;
+    # Wave 2 Plan 03 ships `mnemosyne broker apply-empiria-defaults` which
+    # the fix_cmd messages point at for convergence.
+    if not container:
+        checks.append(
+            Check(
+                name="user settings.yaml auth_selected_type",
+                category="Operator State Drift",
+                _check_fn=_check_user_settings_auth_type,
+            )
+        )
+        checks.append(
+            Check(
+                name="grove settings.yaml empiria defaults",
+                category="Operator State Drift",
+                _check_fn=_check_grove_settings,
+            )
+        )
+        checks.append(
+            Check(
+                name="user profile env no MNEMOSYNE_VAULT override",
+                category="Operator State Drift",
+                _check_fn=_check_user_profile_env_no_overrides,
+            )
+        )
+
     return checks
 
 
@@ -1397,6 +1425,151 @@ def _check_claude_onboarding_drift() -> CheckResult:
     return CheckResult(
         ok=True,
         message=f"template={template_ver} ≥ host={host_ver}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# SBR-3.7: Operator-state drift checks (Phase 33.3)
+# ---------------------------------------------------------------------------
+
+EXPECTED_AUTH_SELECTED_TYPE = "oauth-token"
+EXPECTED_GROVE_TEMPLATE = "empiria-agent"
+EXPECTED_GROVE_HARNESS = "claude"
+
+
+def _check_user_settings_auth_type() -> CheckResult:
+    """SBR-3.7 (a): ~/.scion/settings.yaml has harness_configs.claude.auth_selected_type=oauth-token.
+
+    Phase 33.2 Plan 01 switched documented auth from CLAUDE_AUTH file-secret to
+    CLAUDE_CODE_OAUTH_TOKEN env-secret. Operators following pre-33.2 docs left
+    this field at 'auth-file'; the broker keeps mounting the deprecated secret
+    until this field flips to 'oauth-token'. (UAT-discovered late in 33.2.)
+
+    Pure read; no _fix_fn attached (Phase 33.1 D-21 — doctor read-only in 33.x).
+    """
+    import yaml
+
+    from mnemosyne_cli.lib import broker as broker_lib
+    from mnemosyne_cli.lib.scion_paths import user_settings_path
+
+    path = user_settings_path()
+    try:
+        data = broker_lib.yaml_safe_load_or_none(path)
+    except yaml.YAMLError as e:
+        return CheckResult(ok=False, message=f"Malformed YAML at {path}: {e}")
+    if data is None:
+        return CheckResult(
+            ok=True,
+            message=(
+                f"No {path} — broker may not be initialised "
+                "(run `mnemosyne broker install`)."
+            ),
+        )
+    actual = (data.get("harness_configs") or {}).get("claude", {}).get(
+        "auth_selected_type"
+    )
+    if actual != EXPECTED_AUTH_SELECTED_TYPE:
+        return CheckResult(
+            ok=False,
+            message=(
+                f"{path}: harness_configs.claude.auth_selected_type={actual!r}; "
+                f"expected {EXPECTED_AUTH_SELECTED_TYPE!r}"
+            ),
+            fix_cmd="mnemosyne broker apply-empiria-defaults",
+        )
+    return CheckResult(
+        ok=True, message=f"{path}: auth_selected_type={EXPECTED_AUTH_SELECTED_TYPE}"
+    )
+
+
+def _check_grove_settings() -> CheckResult:
+    """SBR-3.7 (b): every grove's .scion/settings.yaml has Empiria default_template + default_harness_config.
+
+    Drift class verified live on 2026-05-19: mnemosyne__9aa1f789 has
+    default_template=default, default_harness_config=gemini (instead of
+    empiria-agent + claude).
+
+    SCION's auto-test groves (auto-*, test-*, cleanup-*, etc.) are skipped
+    by lib/scion_paths.DEFAULT_SKIP_PREFIXES.
+
+    Pure read; no _fix_fn attached (Phase 33.1 D-21 — doctor read-only in 33.x).
+    """
+    import yaml
+
+    from mnemosyne_cli.lib import broker as broker_lib
+    from mnemosyne_cli.lib.scion_paths import iter_grove_settings_paths
+
+    drifted: list[str] = []
+    for path in iter_grove_settings_paths():
+        try:
+            data = broker_lib.yaml_safe_load_or_none(path)
+        except yaml.YAMLError as e:
+            return CheckResult(ok=False, message=f"Malformed YAML at {path}: {e}")
+        if data is None:
+            continue  # iter only yields existing files — defensive
+        tmpl = data.get("default_template")
+        harness = data.get("default_harness_config")
+        if tmpl != EXPECTED_GROVE_TEMPLATE or harness != EXPECTED_GROVE_HARNESS:
+            # path is ~/.scion/grove-configs/<grove>/.scion/settings.yaml
+            # grove name is parent of parent.
+            drifted.append(
+                f"{path.parent.parent.name}: template={tmpl!r} harness={harness!r}"
+            )
+    if drifted:
+        joined = "\n  ".join(drifted)
+        return CheckResult(
+            ok=False,
+            message=f"Groves with non-Empiria defaults:\n  {joined}",
+            fix_cmd="mnemosyne broker apply-empiria-defaults",
+        )
+    return CheckResult(
+        ok=True,
+        message=f"All groves use {EXPECTED_GROVE_TEMPLATE} + {EXPECTED_GROVE_HARNESS} defaults",
+    )
+
+
+def _check_user_profile_env_no_overrides() -> CheckResult:
+    """SBR-3.7 (c): no ~/.scion/settings.yaml profile sets MNEMOSYNE_VAULT.
+
+    Drift class observed live in 33.2 UAT: profiles.local.env.MNEMOSYNE_VAULT
+    shadowed the empiria-agent template's /vault mount target. The template
+    provides MNEMOSYNE_VAULT=/vault inside the container — user-profile env
+    is an unintended override.
+
+    Pure read; no _fix_fn attached (Phase 33.1 D-21 — doctor read-only in 33.x).
+    """
+    import yaml
+
+    from mnemosyne_cli.lib import broker as broker_lib
+    from mnemosyne_cli.lib.scion_paths import user_settings_path
+
+    path = user_settings_path()
+    try:
+        data = broker_lib.yaml_safe_load_or_none(path)
+    except yaml.YAMLError as e:
+        return CheckResult(ok=False, message=f"Malformed YAML at {path}: {e}")
+    if data is None:
+        return CheckResult(ok=True, message=f"No {path}.")
+    overrides: list[str] = []
+    for profile_name, profile in (data.get("profiles") or {}).items():
+        env = (profile or {}).get("env") or {}
+        if "MNEMOSYNE_VAULT" in env:
+            overrides.append(
+                f"profiles.{profile_name}.env.MNEMOSYNE_VAULT={env['MNEMOSYNE_VAULT']}"
+            )
+    if overrides:
+        joined = "; ".join(overrides)
+        return CheckResult(
+            ok=False,
+            message=(
+                f"User profile env overrides container-only var: {joined}. "
+                "Remove these — the empiria-agent template's /vault mount is "
+                "the canonical target."
+            ),
+            fix_cmd="mnemosyne broker apply-empiria-defaults",
+        )
+    return CheckResult(
+        ok=True, message="No profile env overrides for MNEMOSYNE_VAULT"
     )
 
 
