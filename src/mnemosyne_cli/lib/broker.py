@@ -350,16 +350,27 @@ def writable(paths: list[Path]) -> Iterator[None]:
 
 
 def _atomic_write(path: Path, content: bytes | str) -> None:
-    """Write content to path atomically (tempfile + os.replace)."""
+    """Write content to path atomically (tempfile + os.replace).
+
+    The tempfile lifecycle is guarded by try/finally: if tmp.write() or
+    os.replace() raises, the .mnemosyne-tmp-* file is unlinked before the
+    exception propagates, leaving no orphan in path.parent.
+    """
     if isinstance(content, str):
         content = content.encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent, delete=False, prefix=".mnemosyne-tmp-"
-    ) as tmp:
-        tmp.write(content)
-        tmp_path = Path(tmp.name)
-    os.replace(tmp_path, path)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, delete=False, prefix=".mnemosyne-tmp-"
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(content)
+        os.replace(tmp_path, path)
+        tmp_path = None  # successfully renamed onto target — nothing to clean up
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
 
 
 def _default_seed_dir() -> Path:
