@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -176,3 +177,53 @@ def apply_empiria_defaults_cmd(
         console.print(f"\nWould apply {len(result.written)} canonical updates.")
     else:
         console.print(f"\nApplied {len(result.written)} canonical updates.")
+
+
+@app.command("check-control-channel")
+def check_control_channel_cmd(
+    restart_if_stale: bool = typer.Option(
+        False,
+        "--restart-if-stale",
+        help="If broker is stale/disconnected, run `systemctl --user restart scion-broker`.",
+    ),
+) -> None:
+    """Phase 33.3 SBR-3.3 helper (CONTEXT D-38).
+
+    Used by both operators (manual check) and the systemd Path-unit watchdog
+    (with --restart-if-stale).
+
+    Exit codes (per D-38 — successful auto-recovery MUST exit 0 to avoid burning
+    the Path-unit's StartLimitBurst slots on every recovery):
+
+      | Check | --restart-if-stale | Restart returncode | exit |
+      |-------|--------------------|--------------------|------|
+      | PASS  | (either)           | (not run)          |  0   |
+      | FAIL  | False              | (not run)          |  1   |
+      | FAIL  | True               | == 0               |  0   |  <- successful recovery
+      | FAIL  | True               | != 0               |  1   |  <- restart actually failed
+    """
+    result = broker.check_control_channel()
+    if result.ok:
+        console.print(f"[green]ok[/green] {result.message}")
+        return  # exit 0
+
+    # Check returned FAIL.
+    console.print(f"[red]fail[/red] {result.message}")
+
+    if not restart_if_stale:
+        # Diagnostic mode — surface FAIL to operator with non-zero exit.
+        raise typer.Exit(1)
+
+    # --restart-if-stale set: attempt recovery.
+    console.print("Restarting scion-broker...")
+    proc = subprocess.run(
+        ["systemctl", "--user", "restart", "scion-broker"],
+        check=False,
+    )
+    if proc.returncode == 0:
+        console.print("Restart issued successfully.")
+        return  # exit 0 — successful auto-recovery, do NOT burn StartLimitBurst slot
+    console.print(
+        f"[red]Restart subprocess failed (returncode={proc.returncode})[/red]"
+    )
+    raise typer.Exit(1)

@@ -379,3 +379,105 @@ def test_apply_empiria_defaults_cmd_exits_when_settings_missing(
     with pytest.raises(typer.Exit) as exc:
         broker_cmd.apply_empiria_defaults_cmd(dry_run=False)
     assert exc.value.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 33.3 — Task 04.1 check-control-channel verb exit-code matrix (D-38)
+# ---------------------------------------------------------------------------
+
+
+def test_check_control_channel_verb_passes(monkeypatch, capsys):
+    """PASS check -> exit 0, no restart attempted."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+    from mnemosyne_cli.lib.symlinks import CheckResult
+
+    monkeypatch.setattr(
+        broker_lib,
+        "check_control_channel",
+        lambda: CheckResult(ok=True, message="healthy"),
+    )
+    # Should NOT raise typer.Exit.
+    broker_cmd.check_control_channel_cmd(restart_if_stale=False)
+    out = capsys.readouterr().out
+    assert "ok" in out and "healthy" in out
+
+
+def test_check_control_channel_verb_fail_diagnostic_mode_exits_1(monkeypatch):
+    """FAIL check without --restart-if-stale -> exit 1 (diagnostic mode)."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+    from mnemosyne_cli.lib.symlinks import CheckResult
+
+    monkeypatch.setattr(
+        broker_lib,
+        "check_control_channel",
+        lambda: CheckResult(ok=False, message="stale"),
+    )
+    with pytest.raises(typer.Exit) as exc:
+        broker_cmd.check_control_channel_cmd(restart_if_stale=False)
+    assert exc.value.exit_code == 1
+
+
+def test_check_control_channel_verb_successful_restart_exits_0(monkeypatch, capsys):
+    """FAIL check + --restart-if-stale + restart returncode 0 -> exit 0 (per D-38).
+
+    This is the CRITICAL test: successful auto-recovery MUST NOT raise typer.Exit,
+    otherwise the systemd Path-unit would record a failed trigger and burn a
+    StartLimitBurst slot on every successful recovery, deactivating the watchdog
+    after 5 recoveries in 10 minutes.
+    """
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+    from mnemosyne_cli.lib.symlinks import CheckResult
+
+    monkeypatch.setattr(
+        broker_lib,
+        "check_control_channel",
+        lambda: CheckResult(ok=False, message="stale", fix_cmd=""),
+    )
+
+    class _OkProc:
+        returncode = 0
+
+    calls = []
+
+    def _spy(cmd, *a, **k):
+        calls.append(cmd)
+        return _OkProc()
+
+    monkeypatch.setattr("subprocess.run", _spy)
+
+    # Should NOT raise typer.Exit — exit 0 path.
+    broker_cmd.check_control_channel_cmd(restart_if_stale=True)
+    assert any(
+        "systemctl" in c and "restart" in c for c in calls
+    ), "restart subprocess must be invoked"
+    out = capsys.readouterr().out
+    assert "successfully" in out
+
+
+def test_check_control_channel_verb_failed_restart_exits_1(monkeypatch):
+    """FAIL check + --restart-if-stale + restart returncode != 0 -> exit 1.
+
+    Genuine restart failure (e.g., systemd refuses, unit masked) legitimately
+    consumes a StartLimitBurst slot.
+    """
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+    from mnemosyne_cli.lib.symlinks import CheckResult
+
+    monkeypatch.setattr(
+        broker_lib,
+        "check_control_channel",
+        lambda: CheckResult(ok=False, message="stale", fix_cmd=""),
+    )
+
+    class _FailProc:
+        returncode = 5
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _FailProc())
+
+    with pytest.raises(typer.Exit) as exc:
+        broker_cmd.check_control_channel_cmd(restart_if_stale=True)
+    assert exc.value.exit_code == 1
