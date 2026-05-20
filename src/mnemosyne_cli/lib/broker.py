@@ -689,17 +689,25 @@ def render_restart_service(mnemosyne_bin: Path) -> str:
     recovery exits 0 so the StartLimitBurst slot is preserved for genuine
     restart failures.
     """
+    # NOTE (deviation Rule 1 — correctness fix): StartLimitIntervalSec= and
+    # StartLimitBurst= are [Unit]-section directives in modern systemd
+    # (systemd.unit(5), verified on systemd 255). The plan's artifact sketch
+    # placed them under [Service]; systemd >= 230 ignores them there (with a
+    # deprecation warning), which would defeat threat T-33.3-04-01's restart-
+    # loop rate limit entirely. They are emitted under [Unit] here so the
+    # rate limit actually applies. The burst budget still counts only FAILED
+    # triggers — successful recoveries exit 0 (D-38) and are not failures.
     return f"""[Unit]
 Description=Restart scion-broker when control-channel goes stale
-
-[Service]
-Type=oneshot
-ExecStart={mnemosyne_bin} broker check-control-channel --restart-if-stale
 # Rate limit: at most 5 failed triggers in 10 minutes (RESEARCH Pitfall 1).
 # Successful recoveries exit 0 and do NOT count toward the burst budget
 # (per CONTEXT D-38 + Task 04.1 exit-code matrix).
 StartLimitIntervalSec=600
 StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart={mnemosyne_bin} broker check-control-channel --restart-if-stale
 
 [Install]
 WantedBy=default.target
