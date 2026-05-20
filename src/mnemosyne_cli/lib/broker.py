@@ -350,11 +350,16 @@ def writable(paths: list[Path]) -> Iterator[None]:
 
 
 def _atomic_write(path: Path, content: bytes | str) -> None:
-    """Write content to path atomically (tempfile + os.replace).
+    """Write content to path atomically and durably (tempfile + fsync + os.replace).
 
     The tempfile lifecycle is guarded by try/finally: if tmp.write() or
     os.replace() raises, the .mnemosyne-tmp-* file is unlinked before the
     exception propagates, leaving no orphan in path.parent.
+
+    Crash safety: the tempfile's data blocks are flushed and fsync'd before
+    os.replace(), so a power loss between the rename and the kernel flushing
+    the data cannot leave a zero-length or torn file at path. os.replace()
+    itself makes the directory-entry swap atomic (no torn rename).
     """
     if isinstance(content, str):
         content = content.encode("utf-8")
@@ -366,6 +371,8 @@ def _atomic_write(path: Path, content: bytes | str) -> None:
         ) as tmp:
             tmp_path = Path(tmp.name)
             tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
         os.replace(tmp_path, path)
         tmp_path = None  # successfully renamed onto target — nothing to clean up
     finally:
