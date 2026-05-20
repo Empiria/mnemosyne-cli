@@ -13,13 +13,17 @@ config.toml is the only place a vault path lives on a given machine.
 
 from __future__ import annotations
 
+import os
 import platform
 import plistlib
 import re
 import shutil
-from dataclasses import dataclass
+import subprocess
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 SYSTEMD_UNIT_PATH = Path("~/.config/systemd/user/scion-broker.service").expanduser()
 LAUNCHD_PLIST_PATH = Path(
@@ -239,3 +243,281 @@ def yaml_safe_load_or_none(path: Path) -> dict | None:
         return None
     text = path.read_text()
     return yaml.safe_load(text) or {}
+
+
+# ---------------------------------------------------------------------------
+# SBR-3.1 + SBR-3.7: Harness-config overlay + operator-state convergence
+# ---------------------------------------------------------------------------
+
+EXPECTED_AUTH_SELECTED_TYPE = "oauth-token"
+EXPECTED_GROVE_TEMPLATE = "empiria-agent"
+EXPECTED_GROVE_HARNESS = "claude"
+
+
+def get_protected_paths() -> list[Path]:
+    """Return the two harness-config paths the chattr lock guards.
+
+    LAZY — re-evaluates at every call so tests that monkeypatch Path.home()
+    AFTER import time see the patched home. Per Plan 03 Task 03.2 fix
+    (planning revision): a module-level ``PROTECTED_PATHS = [...]`` would
+    resolve against the real host at import time and break monkeypatched
+    tests. The two scion_paths helpers themselves call Path.home() at call
+    time, so this function is idempotent and safe to call repeatedly.
+    """
+    from mnemosyne_cli.lib.scion_paths import (
+        harness_config_claude_json,
+        harness_config_yaml,
+    )
+
+    return [
+        harness_config_claude_json(),
+        harness_config_yaml(),
+    ]
+
+
+@dataclass
+class OverlayResult:
+    """Summary of an overlay / convergence run.
+
+    Falsy when nothing was written — `apply_empiria_defaults` returns this and
+    Wave 0 tests rely on `assert not result` for idempotency / `assert result`
+    for dry-run-found-changes. `__bool__` keys off `written` only.
+    """
+
+    written: list[Path] = field(default_factory=list)
+    unchanged: list[Path] = field(default_factory=list)
+    skipped: list[Path] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.written)
+
+
+@dataclass
+class CanonicalChange:
+    path: Path
+    current: dict | None
+    target: dict
+
+
+@contextmanager
+def writable(paths: list[Path]) -> Iterator[None]:
+    """Temporarily strip chattr +i from existing paths; restore on exit.
+
+    Idempotent: chattr -i on a non-immutable file is a no-op (exit 0).
+    check=False so the helper survives EPERM / EROFS / missing-binary failures
+    on hosts where chattr is unavailable (e.g., macOS, tmpfs without xattr).
+
+    Implementation note: the paths may not exist when the broker is first
+    installed; we only chattr files that currently exist on disk.
+    """
+    existing = [p for p in paths if p.exists()]
+    for p in existing:
+        subprocess.run(["chattr", "-i", str(p)], check=False)
+    try:
+        yield
+    finally:
+        for p in existing:
+            if p.exists():
+                subprocess.run(["chattr", "+i", str(p)], check=False)
+
+
+def _atomic_write(path: Path, content: bytes | str) -> None:
+    """Write content to path atomically (tempfile + os.replace)."""
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, delete=False, prefix=".mnemosyne-tmp-"
+    ) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+
+
+def _default_seed_dir() -> Path:
+    """Locate the canonical harness-config seed dir in the vault."""
+    from mnemosyne_cli.lib import vault
+
+    vault_path = vault.resolve_vault_path()
+    return vault_path / "agents" / "scion-template" / "claude-harness-config"
+
+
+def apply_harness_config_overlay(seed_dir: Path | None = None) -> OverlayResult:
+    """Write canonical .claude.json + config.yaml to ~/.scion/harness-configs/claude/.
+
+    Idempotent. Toggles chattr -i / +i around writes via get_protected_paths()
+    (LAZY — resolved at this call, not at module import). Uses atomic
+    temp+replace for crash safety.
+
+    Raises FileNotFoundError if seed_dir does not exist.
+    """
+    from mnemosyne_cli.lib.scion_paths import (
+        harness_config_claude_json,
+        harness_config_yaml,
+    )
+
+    if seed_dir is None:
+        seed_dir = _default_seed_dir()
+    if not seed_dir.is_dir():
+        raise FileNotFoundError(f"Seed dir does not exist: {seed_dir}")
+
+    result = OverlayResult()
+    # Resolve target paths at call time too (so monkeypatched home is honoured).
+    pairs = [
+        (seed_dir / ".claude.json", harness_config_claude_json()),
+        (seed_dir / "config.yaml", harness_config_yaml()),
+    ]
+
+    with writable(get_protected_paths()):
+        for seed_path, target_path in pairs:
+            if not seed_path.is_file():
+                result.skipped.append(target_path)
+                continue
+            seed_bytes = seed_path.read_bytes()
+            if target_path.exists() and target_path.read_bytes() == seed_bytes:
+                result.unchanged.append(target_path)
+                continue
+            _atomic_write(target_path, seed_bytes)
+            result.written.append(target_path)
+
+    return result
+
+
+def _build_grove_settings_target() -> dict:
+    return {
+        "default_template": EXPECTED_GROVE_TEMPLATE,
+        "default_harness_config": EXPECTED_GROVE_HARNESS,
+    }
+
+
+def _strip_profile_vault_overrides(profiles: dict) -> tuple[dict, bool]:
+    """Return (new_profiles, changed) with profiles.*.env.MNEMOSYNE_VAULT stripped."""
+    new_profiles = dict(profiles)
+    changed = False
+    for pname, pval in list(profiles.items()):
+        pval_t = dict(pval or {})
+        env = dict(pval_t.get("env") or {})
+        if "MNEMOSYNE_VAULT" in env:
+            env.pop("MNEMOSYNE_VAULT")
+            pval_t["env"] = env
+            new_profiles[pname] = pval_t
+            changed = True
+    return new_profiles, changed
+
+
+def compute_canonical_changes() -> list[CanonicalChange]:
+    """Enumerate what apply_empiria_defaults() WOULD write (no side effects).
+
+    Used by `apply-empiria-defaults --dry-run`. One entry per drifted path:
+    user settings.yaml (auth type and/or profile env override), every
+    non-test grove settings.yaml.
+    """
+    import yaml
+
+    from mnemosyne_cli.lib.scion_paths import (
+        iter_grove_settings_paths,
+        user_settings_path,
+    )
+
+    changes: list[CanonicalChange] = []
+
+    # (a)+(c) User settings.yaml — field-level merge (other harness types coexist).
+    user_path = user_settings_path()
+    if user_path.exists():
+        try:
+            user_data = yaml_safe_load_or_none(user_path) or {}
+        except yaml.YAMLError:
+            user_data = {}
+
+        current_auth = (
+            (user_data.get("harness_configs") or {})
+            .get("claude", {})
+            .get("auth_selected_type")
+        )
+        auth_drift = current_auth != EXPECTED_AUTH_SELECTED_TYPE
+
+        new_profiles, profile_drift = _strip_profile_vault_overrides(
+            dict(user_data.get("profiles") or {})
+        )
+
+        if auth_drift or profile_drift:
+            target_data = dict(user_data)
+            if auth_drift:
+                hc = dict(target_data.get("harness_configs") or {})
+                claude_hc = dict(hc.get("claude") or {})
+                claude_hc["auth_selected_type"] = EXPECTED_AUTH_SELECTED_TYPE
+                hc["claude"] = claude_hc
+                target_data["harness_configs"] = hc
+            if profile_drift:
+                target_data["profiles"] = new_profiles
+            changes.append(
+                CanonicalChange(
+                    path=user_path, current=user_data, target=target_data
+                )
+            )
+
+    # (b) Per-grove settings.yaml — whole-file overwrite (D-32).
+    grove_target = _build_grove_settings_target()
+    for grove_path in iter_grove_settings_paths():
+        try:
+            grove_data = yaml_safe_load_or_none(grove_path) or {}
+        except yaml.YAMLError:
+            grove_data = {}
+        if (
+            grove_data.get("default_template") != EXPECTED_GROVE_TEMPLATE
+            or grove_data.get("default_harness_config") != EXPECTED_GROVE_HARNESS
+        ):
+            changes.append(
+                CanonicalChange(
+                    path=grove_path, current=grove_data, target=grove_target
+                )
+            )
+
+    return changes
+
+
+def apply_empiria_defaults(dry_run: bool = False) -> OverlayResult:
+    """Write canonical Empiria settings to user, grove, and harness-config surfaces.
+
+    Pre-flight: if ~/.scion/settings.yaml does not exist, raises FileNotFoundError
+    (caller maps to typer.Exit). RESEARCH Pitfall 5.
+
+    Field-level merge for user settings.yaml (multiple harness types may coexist).
+    Whole-file overwrite for grove settings.yaml (single-purpose, Empiria-owned).
+    Idempotent — re-run on already-canonical state returns an empty (falsy) result.
+    """
+    import yaml
+
+    from mnemosyne_cli.lib.scion_paths import user_settings_path
+
+    if not user_settings_path().exists():
+        raise FileNotFoundError(
+            "Run `scion init` first; then re-run `mnemosyne broker apply-empiria-defaults`."
+        )
+
+    result = OverlayResult()
+    changes = compute_canonical_changes()
+
+    for change in changes:
+        if not dry_run:
+            yaml_text = yaml.safe_dump(
+                change.target, default_flow_style=False, sort_keys=False
+            )
+            _atomic_write(change.path, yaml_text)
+        result.written.append(change.path)
+
+    # Always run the harness-config overlay (idempotent — reuses writable() lock).
+    try:
+        overlay_result = apply_harness_config_overlay()
+        if not dry_run:
+            result.written.extend(overlay_result.written)
+        else:
+            # In dry-run, surface harness-config drift as "would write" too.
+            result.written.extend(overlay_result.written)
+        result.unchanged.extend(overlay_result.unchanged)
+        result.skipped.extend(overlay_result.skipped)
+    except FileNotFoundError:
+        # Vault seed dir not found — warn but don't fail the convergence.
+        pass
+
+    return result
