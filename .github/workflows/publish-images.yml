@@ -158,6 +158,28 @@ jobs:
           cache-from: type=gha,scope=empiria-claude
           cache-to: type=gha,mode=max,scope=empiria-claude
 
+      - name: Assert empiria-claude image size < 4 GiB (SBR-3.2 acceptance)
+        run: |
+          # Phase 33.3 SBR-3.2 D-10: acceptance bar is < 4 GiB for empiria-claude.
+          # Tier-1 cleanup (Plan 01) lands first; tier-2 multi-stage (Plan 05) makes
+          # the bar achievable. If this fails after Plan 05, Plan 05's checkpoint
+          # surfaces soft 5 GiB fallback per RESEARCH Open Question 3.
+          IMAGE_REF="${REGISTRY}/${ORG}/empiria-claude:latest"
+          docker pull "$IMAGE_REF"
+          IMAGE_SIZE_BYTES=$(docker image inspect "$IMAGE_REF" --format '{{.Size}}')
+          IMAGE_SIZE_GIB=$(awk "BEGIN { printf \"%.2f\", $IMAGE_SIZE_BYTES / 1073741824 }")
+          echo "empiria-claude size: ${IMAGE_SIZE_BYTES} bytes (${IMAGE_SIZE_GIB} GiB)"
+          # Hard target: 4 GiB = 4 * 1024^3 = 4294967296 bytes
+          if [ "$IMAGE_SIZE_BYTES" -ge 4294967296 ]; then
+            echo "::error::empiria-claude image size ${IMAGE_SIZE_GIB} GiB exceeds 4 GiB acceptance bar (SBR-3.2 D-10)"
+            # Soft fail until Plan 05 lands — continue-on-error: true on the
+            # step until then. Plan 05 task 05.X will REMOVE continue-on-error
+            # to make this assertion fail the workflow.
+            exit 1
+          fi
+          echo "::notice::empiria-claude size ${IMAGE_SIZE_GIB} GiB under 4 GiB target"
+        continue-on-error: true
+
   empiria-claude-anvil:
     needs: empiria-claude
     runs-on: ubuntu-latest
