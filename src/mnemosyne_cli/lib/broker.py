@@ -411,13 +411,6 @@ def apply_harness_config_overlay(seed_dir: Path | None = None) -> OverlayResult:
     return result
 
 
-def _build_grove_settings_target() -> dict:
-    return {
-        "default_template": EXPECTED_GROVE_TEMPLATE,
-        "default_harness_config": EXPECTED_GROVE_HARNESS,
-    }
-
-
 def _strip_profile_vault_overrides(profiles: dict) -> tuple[dict, bool]:
     """Return (new_profiles, changed) with profiles.*.env.MNEMOSYNE_VAULT stripped."""
     new_profiles = dict(profiles)
@@ -484,8 +477,8 @@ def compute_canonical_changes() -> list[CanonicalChange]:
                 )
             )
 
-    # (b) Per-grove settings.yaml — whole-file overwrite (D-32).
-    grove_target = _build_grove_settings_target()
+    # (b) Per-grove settings.yaml — field-level merge (only the two Empiria-managed
+    # keys are changed; all other operator-configured keys are preserved).
     for grove_path in iter_grove_settings_paths():
         try:
             grove_data = yaml_safe_load_or_none(grove_path) or {}
@@ -495,9 +488,12 @@ def compute_canonical_changes() -> list[CanonicalChange]:
             grove_data.get("default_template") != EXPECTED_GROVE_TEMPLATE
             or grove_data.get("default_harness_config") != EXPECTED_GROVE_HARNESS
         ):
+            target = dict(grove_data)
+            target["default_template"] = EXPECTED_GROVE_TEMPLATE
+            target["default_harness_config"] = EXPECTED_GROVE_HARNESS
             changes.append(
                 CanonicalChange(
-                    path=grove_path, current=grove_data, target=grove_target
+                    path=grove_path, current=grove_data, target=target
                 )
             )
 
