@@ -24,12 +24,19 @@ def fake_scion(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_render_systemd_unit_includes_vault_host(fake_scion: Path) -> None:
+def test_render_systemd_unit_includes_vault_host(fake_scion: Path, tmp_path: Path) -> None:
+    # Phase 33.3 D-04: ExecStart now runs `mnemosyne broker start`, not scion.
+    fake_mnemosyne = tmp_path / "mnemosyne"
+    fake_mnemosyne.write_text("#!/bin/sh\n")
+    fake_mnemosyne.chmod(0o755)
     unit = broker.render_systemd_unit(
-        vault_host=Path("/srv/vault"), scion_bin=fake_scion
+        vault_host=Path("/srv/vault"),
+        scion_bin=fake_scion,
+        mnemosyne_bin=fake_mnemosyne,
     )
     assert "Environment=MNEMOSYNE_VAULT_HOST=/srv/vault" in unit
-    assert f"ExecStart={fake_scion} broker start -p local" in unit
+    assert f"ExecStart={fake_mnemosyne} broker start" in unit
+    assert f"ExecStop={fake_scion} broker stop" in unit
     assert "[Unit]" in unit
     assert "[Install]" in unit
 
@@ -518,3 +525,68 @@ def test_install_writes_pathunit(tmp_path, monkeypatch):
         "scion-broker-control-channel-watchdog.path",
         "scion-broker-restart-on-broken-pipe.service",
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 33.3 — Task 04.2b install verb extension tests
+# ---------------------------------------------------------------------------
+
+
+def test_render_systemd_unit_phase33_3_shape(fake_scion: Path, tmp_path: Path):
+    """Greenfield render carries the D-04 ExecStart shim + D-20 TimeoutStopSec."""
+    from mnemosyne_cli.lib import broker
+
+    fake_mnemosyne = tmp_path / "bin" / "mnemosyne"
+    fake_mnemosyne.parent.mkdir()
+    fake_mnemosyne.write_text("#!/bin/sh\n")
+    fake_mnemosyne.chmod(0o755)
+    unit = broker.render_systemd_unit(
+        vault_host=Path("/srv/vault"),
+        scion_bin=fake_scion,
+        mnemosyne_bin=fake_mnemosyne,
+    )
+    assert f"ExecStart={fake_mnemosyne} broker start" in unit
+    assert "TimeoutStopSec=120" in unit
+    assert f"ExecStop={fake_scion} broker stop" in unit
+
+
+def test_patch_existing_unit_inserts_timeoutstopsec(tmp_path):
+    """SBR-3.1 D-04 + SBR-3.4 D-20: patch existing service file in place."""
+    from mnemosyne_cli.lib import broker
+
+    unit = tmp_path / "scion-broker.service"
+    unit.write_text(
+        "[Unit]\nDescription=SCION Broker\n\n[Service]\n"
+        "Type=forking\nExecStart=/old/scion broker start -p local\n"
+        "[Install]\nWantedBy=default.target\n"
+    )
+    mb = tmp_path / "mnemosyne"
+    mb.write_text("#!/bin/sh\n")
+    mb.chmod(0o755)
+    changed = broker.patch_systemd_unit_phase33_3(unit, mb)
+    assert changed
+    text = unit.read_text()
+    assert "TimeoutStopSec=120" in text
+    assert f"ExecStart={mb} broker start" in text
+    assert "/old/scion broker start" not in text
+    # Idempotent — second run finds nothing to change.
+    assert broker.patch_systemd_unit_phase33_3(unit, mb) is False
+
+
+def test_install_prewarm_calls_podman(monkeypatch):
+    """SBR-3.4 D-19: pre-warm invokes podman with the keep-id userns mapping."""
+    from mnemosyne_cli.lib import broker
+
+    calls = []
+
+    def _spy(cmd, *a, **k):
+        calls.append(cmd)
+        return type("X", (), {"returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", _spy)
+    ok = broker.prewarm_empiria_claude()
+    assert ok
+    assert any(
+        "podman" in c[0] and "empiria-claude:latest" in c for c in calls
+    )
+    assert any("--userns=keep-id:uid=1000,gid=1000" in c for c in calls)

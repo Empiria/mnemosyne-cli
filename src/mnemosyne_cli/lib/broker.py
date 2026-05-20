@@ -76,13 +76,28 @@ def render_systemd_unit(
     scion_bin: Path,
     ssh_auth_sock: str | None = None,
     extra_path: str | None = None,
+    mnemosyne_bin: Path | None = None,
 ) -> str:
+    """Render a fresh scion-broker.service unit.
+
+    Phase 33.3 (D-04 / D-20): ExecStart runs `mnemosyne broker start` (the
+    overlay shim) rather than scion directly, and the [Service] block carries
+    TimeoutStopSec=120. ``mnemosyne_bin`` defaults to ``_find_mnemosyne_bin()``;
+    if mnemosyne is not installed (e.g. during tests) a placeholder path is
+    used and ``install_service()`` surfaces the real error at install time.
+    """
     env_lines = [f"Environment=MNEMOSYNE_VAULT_HOST={vault_host}"]
     if ssh_auth_sock:
         env_lines.append(f"Environment=SSH_AUTH_SOCK={ssh_auth_sock}")
     if extra_path:
         env_lines.append(f"Environment=PATH={extra_path}")
     env_block = "\n".join(env_lines)
+
+    if mnemosyne_bin is None:
+        try:
+            mnemosyne_bin = _find_mnemosyne_bin()
+        except FileNotFoundError:
+            mnemosyne_bin = Path("/usr/local/bin/mnemosyne")
 
     return f"""[Unit]
 Description=SCION Broker
@@ -91,8 +106,9 @@ Wants=network-online.target
 
 [Service]
 Type=forking
+TimeoutStopSec=120
 {env_block}
-ExecStart={scion_bin} broker start -p local
+ExecStart={mnemosyne_bin} broker start
 ExecStop={scion_bin} broker stop
 PIDFile=%h/.scion/broker.pid
 Restart=on-failure
@@ -157,6 +173,18 @@ def install_service(
 
     if path.exists() and not force:
         changed = sync_vault_host(vault_host)
+        # Phase 33.3 D-04 / D-20: also patch ExecStart -> `mnemosyne broker
+        # start` and insert TimeoutStopSec=120. Idempotent; user customisations
+        # (SSH_AUTH_SOCK, PATH, log paths) are preserved by the targeted regex.
+        if p == "linux":
+            try:
+                mnemosyne_bin = _find_mnemosyne_bin()
+                if patch_systemd_unit_phase33_3(path, mnemosyne_bin):
+                    changed = True
+            except FileNotFoundError:
+                # mnemosyne not resolvable — skip the ExecStart rewrite, but the
+                # vault-host sync above still applied.
+                pass
         return InstallResult(path=path, created=False, changed=changed)
 
     scion = scion_bin or find_scion_bin()
@@ -719,3 +747,76 @@ def install_path_unit_watchdog() -> dict[str, Path]:
         PATH_UNIT_NAME: path_unit_path,
         RESTART_SERVICE_NAME: restart_service_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 33.3 SBR-3.4 tier-1: pre-warm empiria-claude image
+# ---------------------------------------------------------------------------
+
+
+def prewarm_empiria_claude(
+    image: str = "empiria-claude:latest", timeout: int = 600
+) -> bool:
+    """D-19: `podman run --rm --userns=keep-id ... empiria-claude:latest true`.
+
+    Returns True on success, False on failure (non-fatal — install continues).
+    Per D-27 + Plan 06: pre-warm is unconditional in this wave. Plan 06 either
+    confirms permanent (DO NOT SWITCH verdict per D-24 default) OR removes
+    this call entirely (SWITCH verdict). No conditional userns-mode gate is
+    introduced — D-27 mandates a binary outcome.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "podman",
+                "run",
+                "--rm",
+                "--userns=keep-id:uid=1000,gid=1000",
+                "--entrypoint=",
+                image,
+                "true",
+            ],
+            check=False,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Phase 33.3 SBR-3.1 D-04: ExecStart rewrite + SBR-3.4 D-20: TimeoutStopSec
+# ---------------------------------------------------------------------------
+
+_EXEC_START_RE = re.compile(r"^ExecStart=.*broker\s+start.*$", re.MULTILINE)
+_TIMEOUT_RE = re.compile(r"^TimeoutStopSec=\d+\s*$", re.MULTILINE)
+
+
+def patch_systemd_unit_phase33_3(path: Path, mnemosyne_bin: Path) -> bool:
+    """Patch an existing scion-broker.service for Phase 33.3.
+
+    - ExecStart=<scion-bin> broker start -p local -> ExecStart=<mnemosyne-bin> broker start
+    - Insert TimeoutStopSec=120 under [Service] if absent
+
+    Returns True if the file changed, False if already patched. Idempotent.
+    """
+    if not path.exists():
+        return False
+    text = path.read_text()
+    original = text
+
+    new_exec = f"ExecStart={mnemosyne_bin} broker start"
+    if _EXEC_START_RE.search(text):
+        text = _EXEC_START_RE.sub(new_exec, text)
+    # Else: no ExecStart line at all -> malformed unit; leave for fresh-render path.
+
+    if not _TIMEOUT_RE.search(text):
+        # Insert directly under the [Service] header.
+        text = text.replace("[Service]", "[Service]\nTimeoutStopSec=120", 1)
+
+    if text == original:
+        return False
+    path.write_text(text)
+    return True
