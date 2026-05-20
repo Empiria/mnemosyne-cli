@@ -459,8 +459,12 @@ def compute_canonical_changes() -> list[CanonicalChange]:
         try:
             user_data = yaml_safe_load_or_none(user_path) or {}
         except yaml.YAMLError:
-            user_data = {}
+            # Malformed settings.yaml — do NOT converge onto a blank target,
+            # which would overwrite (destroy) operator content we could not
+            # parse. Warn and skip; let the operator fix the file by hand.
+            user_data = None
 
+    if user_path.exists() and user_data is not None:
         current_auth = (
             (user_data.get("harness_configs") or {})
             .get("claude", {})
@@ -494,7 +498,10 @@ def compute_canonical_changes() -> list[CanonicalChange]:
         try:
             grove_data = yaml_safe_load_or_none(grove_path) or {}
         except yaml.YAMLError:
-            grove_data = {}
+            # Malformed grove settings.yaml — skip it. Converging onto a
+            # blank-target dict would overwrite (destroy) operator content
+            # we could not parse, the same data-loss class as CR-01.
+            continue
         if (
             grove_data.get("default_template") != EXPECTED_GROVE_TEMPLATE
             or grove_data.get("default_harness_config") != EXPECTED_GROVE_HARNESS
