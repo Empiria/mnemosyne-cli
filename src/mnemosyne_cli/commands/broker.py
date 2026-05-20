@@ -64,6 +64,33 @@ def install(
         except FileNotFoundError as e:
             console.print(f"[yellow]Path-unit watchdog skipped — {e}[/yellow]")
 
+    # Phase 33.3 SBR-3.4 D-19: pre-warm empiria-claude (unconditional this wave).
+    console.print(
+        "Pre-warming empiria-claude:latest (may take up to 10 min on first run)..."
+    )
+    if broker.prewarm_empiria_claude():
+        console.print("Pre-warm completed.")
+    else:
+        console.print(
+            "[yellow]Pre-warm failed or skipped (non-fatal). "
+            "First `scion start` may incur ID-mapped chown.[/yellow]"
+        )
+
+    # Phase 33.3 SBR-3.7 D-31: apply-empiria-defaults convergence at end of run.
+    console.print("Applying Empiria-canonical operator settings...")
+    try:
+        defaults = broker.apply_empiria_defaults(dry_run=False)
+        for p in defaults.written:
+            console.print(f"Wrote {p}")
+        for p in defaults.unchanged:
+            console.print(f"[dim]Already canonical: {p}[/dim]")
+    except FileNotFoundError as e:
+        console.print(f"[yellow]apply-empiria-defaults skipped — {e}[/yellow]")
+        console.print(
+            "After running `scion init`, re-run "
+            "`mnemosyne broker apply-empiria-defaults`."
+        )
+
     console.print(f"\nReload the broker:\n  {broker.reload_command(platform_name)}")
 
 
