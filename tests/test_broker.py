@@ -481,3 +481,40 @@ def test_check_control_channel_verb_failed_restart_exits_1(monkeypatch):
     with pytest.raises(typer.Exit) as exc:
         broker_cmd.check_control_channel_cmd(restart_if_stale=True)
     assert exc.value.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 33.3 — Task 04.2a Path-unit watchdog emission
+# ---------------------------------------------------------------------------
+
+
+def test_install_writes_pathunit(tmp_path, monkeypatch):
+    """SBR-3.3 D-17: install_path_unit_watchdog writes both unit files."""
+    from mnemosyne_cli.lib import broker
+
+    mb = tmp_path / "mnemosyne"
+    mb.write_text("#!/bin/sh\n")
+    mb.chmod(0o755)
+    monkeypatch.setattr(broker, "_find_mnemosyne_bin", lambda: mb)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    # Suppress systemctl calls.
+    monkeypatch.setattr(
+        "subprocess.run", lambda *a, **k: type("X", (), {"returncode": 0})()
+    )
+    units = broker.install_path_unit_watchdog()
+    unit_dir = tmp_path / ".config" / "systemd" / "user"
+    assert (unit_dir / "scion-broker-control-channel-watchdog.path").exists()
+    assert (unit_dir / "scion-broker-restart-on-broken-pipe.service").exists()
+    svc_text = (
+        unit_dir / "scion-broker-restart-on-broken-pipe.service"
+    ).read_text()
+    assert "StartLimitBurst=5" in svc_text
+    assert "StartLimitIntervalSec=600" in svc_text
+    assert (
+        f"ExecStart={mb} broker check-control-channel --restart-if-stale"
+        in svc_text
+    )
+    assert set(units) == {
+        "scion-broker-control-channel-watchdog.path",
+        "scion-broker-restart-on-broken-pipe.service",
+    }

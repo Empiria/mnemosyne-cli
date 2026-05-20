@@ -53,7 +53,16 @@ def install(
         console.print(f"Patched MNEMOSYNE_VAULT_HOST in {result.path}")
     else:
         console.print(f"{result.path} already up to date")
-        return
+
+    # Phase 33.3 SBR-3.3 D-17: Path-unit watchdog (Task 04.2a). Linux-only —
+    # gracefully skipped on macOS / non-linux platforms.
+    if platform_name == "linux":
+        try:
+            units = broker.install_path_unit_watchdog()
+            for _name, path in units.items():
+                console.print(f"Wrote {path}")
+        except FileNotFoundError as e:
+            console.print(f"[yellow]Path-unit watchdog skipped — {e}[/yellow]")
 
     console.print(f"\nReload the broker:\n  {broker.reload_command(platform_name)}")
 
