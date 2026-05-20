@@ -1321,6 +1321,19 @@ def _build_checks(
             )
         )
 
+    # --- Category: Broker Reliability (SBR-3.3, D-15/D-16) ---
+    # Host-side only, read-only (D-21 inherited — no _fix_fn). Queries
+    # `scion hub brokers --json` (NOT log-tail grep) so the same helper backs
+    # both this tier-1 doctor check and the tier-2 Path-unit watchdog verb.
+    if not container:
+        checks.append(
+            Check(
+                name="broker control-channel health",
+                category="Broker Reliability",
+                _check_fn=_check_broker_control_channel_health,
+            )
+        )
+
     # --- Category: Operator State Drift (SBR-3.7, D-29 a/b/c) ---
     # Host-side only, read-only (D-21 inherited — no _fix_fn). Surfaces the
     # three operator-state drift classes that 33.2 UAT discovered late;
@@ -1571,6 +1584,19 @@ def _check_user_profile_env_no_overrides() -> CheckResult:
     return CheckResult(
         ok=True, message="No profile env overrides for MNEMOSYNE_VAULT"
     )
+
+
+def _check_broker_control_channel_health() -> CheckResult:
+    """SBR-3.3 tier-1: broker control-channel staleness check.
+
+    Delegates to `broker.check_control_channel()` (DRY — the same helper backs
+    the tier-2 Path-unit watchdog verb). The helper queries
+    `scion hub brokers --json` and compares lastHeartbeat against a 120s
+    freshness threshold. Pure read; no _fix_fn (Phase 33.1 D-21).
+    """
+    from mnemosyne_cli.lib import broker as broker_lib
+
+    return broker_lib.check_control_channel()
 
 
 def _components_apply_here(cwd: Path, vault_path: Path) -> bool:
