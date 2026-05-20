@@ -6,6 +6,7 @@ import plistlib
 from pathlib import Path
 
 import pytest
+import typer
 
 from mnemosyne_cli.lib import broker
 
@@ -273,3 +274,108 @@ def test_reload_command_macos() -> None:
         broker.reload_command("macos")
         == f"launchctl kickstart -k gui/$UID/{broker.LAUNCHD_LABEL}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 33.3 — SBR-3.1 / SBR-3.7 verbs (start, restore-config, apply-empiria-defaults)
+# ---------------------------------------------------------------------------
+
+
+def test_start_calls_overlay_then_execvp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SBR-3.1 D-04: start verb applies overlay then execs scion."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        broker_lib, "apply_harness_config_overlay", lambda *a, **k: broker_lib.OverlayResult()
+    )
+    monkeypatch.setattr("os.execvp", lambda *args: calls.append(args))
+    broker_cmd.start()
+    assert calls and calls[0][0] == "scion"
+    assert calls[0][1] == ["scion", "broker", "start", "-p", "local"]
+
+
+def test_start_execs_even_when_overlay_raises(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Overlay failure must NOT prevent broker startup (RESEARCH Pattern 2)."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+
+    calls: list[tuple] = []
+
+    def _boom(*a, **k):
+        raise RuntimeError("overlay broke")
+
+    monkeypatch.setattr(broker_lib, "apply_harness_config_overlay", _boom)
+    monkeypatch.setattr("os.execvp", lambda *args: calls.append(args))
+    broker_cmd.start()
+    assert calls, "execvp must run even when overlay raises"
+    err = capsys.readouterr().err
+    assert "overlay broke" in err  # logged to stderr
+
+
+def test_restore_config_calls_apply_overlay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SBR-3.1 D-33: restore-config delegates to lib helper."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+
+    called_with: dict = {}
+
+    def _spy(seed_dir=None):
+        called_with["seed_dir"] = seed_dir
+        return broker_lib.OverlayResult(written=[tmp_path / "out"])
+
+    monkeypatch.setattr(broker_lib, "apply_harness_config_overlay", _spy)
+    broker_cmd.restore_config(seed_dir=None)
+    assert "seed_dir" in called_with
+
+
+def test_restore_config_exits_on_missing_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """restore-config maps FileNotFoundError (bad --seed-dir) to exit 1."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+
+    def _missing(seed_dir=None):
+        raise FileNotFoundError("Seed dir does not exist")
+
+    monkeypatch.setattr(broker_lib, "apply_harness_config_overlay", _missing)
+    with pytest.raises(typer.Exit) as exc:
+        broker_cmd.restore_config(seed_dir=Path("/nonexistent"))
+    assert exc.value.exit_code == 1
+
+
+def test_apply_empiria_defaults_cmd_dry_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """--dry-run flag passthrough; output uses [would write] prefix."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+
+    monkeypatch.setattr(
+        broker_lib,
+        "apply_empiria_defaults",
+        lambda dry_run=False: broker_lib.OverlayResult(written=[Path("/tmp/x")]),
+    )
+    broker_cmd.apply_empiria_defaults_cmd(dry_run=True)
+    out = capsys.readouterr().out
+    assert "[would write]" in out and "Would apply" in out
+
+
+def test_apply_empiria_defaults_cmd_exits_when_settings_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pitfall 5: missing settings.yaml -> exit 1."""
+    from mnemosyne_cli.commands import broker as broker_cmd
+    from mnemosyne_cli.lib import broker as broker_lib
+
+    def _missing(dry_run=False):
+        raise FileNotFoundError("Run `scion init` first")
+
+    monkeypatch.setattr(broker_lib, "apply_empiria_defaults", _missing)
+    with pytest.raises(typer.Exit) as exc:
+        broker_cmd.apply_empiria_defaults_cmd(dry_run=False)
+    assert exc.value.exit_code == 1

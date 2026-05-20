@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+from typing import NoReturn
+
 import typer
 from rich.console import Console
 
@@ -63,3 +68,111 @@ def show() -> None:
     console.print(str(path))
     if not path.exists():
         console.print("[dim](does not exist — run `mnemosyne broker install`)[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Phase 33.3 — SBR-3.1 / SBR-3.7 verbs
+# ---------------------------------------------------------------------------
+
+
+@app.command("start")
+def start() -> NoReturn:
+    """systemd ExecStart shim (Phase 33.3 SBR-3.1 D-04).
+
+    Applies the Empiria harness-config overlay (chattr -i -> write canonical ->
+    chattr +i) then exec's `scion broker start -p local`, replacing this Python
+    process so systemd's Type=forking PID model sees scion as the main PID.
+
+    Overlay failures are logged to stderr but do NOT prevent the broker from
+    starting — a drift bug must not become a broker outage.
+    """
+    try:
+        result = broker.apply_harness_config_overlay()
+        for p in result.written:
+            # journalctl captures stderr — `journalctl --user -u scion-broker`.
+            print(f"[mnemosyne broker start] wrote {p}", file=sys.stderr)
+    except FileNotFoundError as e:
+        print(
+            f"[mnemosyne broker start] overlay failed "
+            f"(non-fatal — vault seed dir missing): {e}",
+            file=sys.stderr,
+        )
+    except Exception as e:  # noqa: BLE001 — overlay failure must never block start
+        print(
+            f"[mnemosyne broker start] overlay failed (non-fatal): {e}",
+            file=sys.stderr,
+        )
+
+    os.execvp("scion", ["scion", "broker", "start", "-p", "local"])
+    # execvp does not return on success; if it returns at all, Python's
+    # OSError propagates and systemd's Restart=on-failure will retry.
+
+
+@app.command("restore-config")
+def restore_config(
+    seed_dir: Path = typer.Option(
+        None,
+        "--seed-dir",
+        help=(
+            "Override the canonical seed dir "
+            "(default: $MNEMOSYNE_VAULT/agents/scion-template/claude-harness-config/)."
+        ),
+    ),
+) -> None:
+    """Re-apply Empiria harness-config seed to ~/.scion/harness-configs/claude/.
+
+    Phase 33.3 SBR-3.1 tactical fix for "the broker just clobbered my
+    harness-config". Idempotent — already-canonical files are not re-written.
+    Toggles chattr -i / +i around the writes.
+    """
+    try:
+        result = broker.apply_harness_config_overlay(seed_dir=seed_dir)
+    except FileNotFoundError as e:
+        error_console.print(str(e))
+        raise typer.Exit(1)
+
+    for written in result.written:
+        console.print(f"Wrote {written}")
+    for unchanged in result.unchanged:
+        console.print(f"[dim]Already canonical: {unchanged}[/dim]")
+    for skipped in result.skipped:
+        console.print(f"[yellow]Skipped (seed file missing): {skipped}[/yellow]")
+
+    if not result.written and not result.unchanged and not result.skipped:
+        console.print("Nothing to do.")
+
+
+@app.command("apply-empiria-defaults")
+def apply_empiria_defaults_cmd(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would change without writing."
+    ),
+) -> None:
+    """Write canonical Empiria settings to user, grove, and harness-config surfaces.
+
+    Phase 33.3 SBR-3.7 tier-2. Idempotent and overwrite-on-mismatch (D-32).
+    For grove settings.yaml: writes the whole file. For user settings.yaml:
+    field-level merge (only fields Empiria manages — auth_selected_type, profile
+    env). Comments and unrelated keys in grove files are not preserved (D-32).
+
+    Pre-flight: requires ~/.scion/settings.yaml to exist (run `scion init` first).
+    """
+    try:
+        result = broker.apply_empiria_defaults(dry_run=dry_run)
+    except FileNotFoundError as e:
+        error_console.print(str(e))
+        raise typer.Exit(1)
+
+    # Escape the brackets — Rich treats "[would write]" as a markup tag otherwise.
+    prefix = r"\[would write]" if dry_run else "Wrote"
+    for written in result.written:
+        console.print(f"{prefix} {written}")
+    for unchanged in result.unchanged:
+        console.print(f"[dim]Already canonical: {unchanged}[/dim]")
+    for skipped in result.skipped:
+        console.print(f"[yellow]Skipped: {skipped}[/yellow]")
+
+    if dry_run:
+        console.print(f"\nWould apply {len(result.written)} canonical updates.")
+    else:
+        console.print(f"\nApplied {len(result.written)} canonical updates.")
