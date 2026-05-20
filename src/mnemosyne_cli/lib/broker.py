@@ -541,19 +541,19 @@ def apply_empiria_defaults(dry_run: bool = False) -> OverlayResult:
             _atomic_write(change.path, yaml_text)
         result.written.append(change.path)
 
-    # Always run the harness-config overlay (idempotent — reuses writable() lock).
-    try:
-        overlay_result = apply_harness_config_overlay()
-        if not dry_run:
+    # Run the harness-config overlay only when NOT in dry-run.
+    # apply_harness_config_overlay() has no dry_run parameter — it always calls
+    # _atomic_write for real. Calling it under dry_run would mutate the
+    # filesystem and then mislabel the mutation as "would write".
+    if not dry_run:
+        try:
+            overlay_result = apply_harness_config_overlay()
             result.written.extend(overlay_result.written)
-        else:
-            # In dry-run, surface harness-config drift as "would write" too.
-            result.written.extend(overlay_result.written)
-        result.unchanged.extend(overlay_result.unchanged)
-        result.skipped.extend(overlay_result.skipped)
-    except FileNotFoundError:
-        # Vault seed dir not found — warn but don't fail the convergence.
-        pass
+            result.unchanged.extend(overlay_result.unchanged)
+            result.skipped.extend(overlay_result.skipped)
+        except FileNotFoundError:
+            # Vault seed dir not found — warn but don't fail the convergence.
+            pass
 
     return result
 
