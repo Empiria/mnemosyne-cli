@@ -658,60 +658,43 @@ def check_control_channel() -> "CheckResult":
 
 
 # ---------------------------------------------------------------------------
-# Phase 33.3 SBR-3.3 tier-2: Path-unit watchdog renderers
+# Phase 33.3 SBR-3.3 tier-2: Path-unit watchdog cleanup
+# The watchdog was removed (UAT Scenario D FAIL — restart-loop on broker.log).
+# These constants are kept so uninstall_path_unit_watchdog() can name the files
+# to clean up on hosts that have the defective units from a prior install.
 # ---------------------------------------------------------------------------
 
 PATH_UNIT_NAME = "scion-broker-control-channel-watchdog.path"
 RESTART_SERVICE_NAME = "scion-broker-restart-on-broken-pipe.service"
 
 
-def render_path_unit() -> str:
-    """SBR-3.3 D-16 watchdog .path unit — triggers on broker.log writes."""
-    return """[Unit]
-Description=Watch SCION broker log for control-channel breaks
+def uninstall_path_unit_watchdog() -> list[Path]:
+    """Remove any stale Path-unit watchdog units left by a prior `mnemosyne broker install`.
 
-[Path]
-PathModified=%h/.scion/broker.log
-Unit=scion-broker-restart-on-broken-pipe.service
+    Safe to call on hosts that never had the watchdog — all subprocess calls use
+    check=False and unlink is guarded by .exists(). Idempotent.
 
-[Install]
-WantedBy=default.target
-"""
-
-
-def render_restart_service(mnemosyne_bin: Path) -> str:
-    """SBR-3.3 D-16 triggered .service unit. ExecStart calls the D-38 verb.
-
-    ExecStart calls `mnemosyne broker check-control-channel --restart-if-stale`
-    which queries `scion hub brokers --json` and restarts the broker only if
-    actually stale (avoids RESEARCH Pitfall 1 — restart loop on already-healed
-    broken-pipe log entries). Per the D-38 exit-code matrix, successful
-    recovery exits 0 so the StartLimitBurst slot is preserved for genuine
-    restart failures.
+    Returns the list of unit-file Paths that were actually removed.
     """
-    # NOTE (deviation Rule 1 — correctness fix): StartLimitIntervalSec= and
-    # StartLimitBurst= are [Unit]-section directives in modern systemd
-    # (systemd.unit(5), verified on systemd 255). The plan's artifact sketch
-    # placed them under [Service]; systemd >= 230 ignores them there (with a
-    # deprecation warning), which would defeat threat T-33.3-04-01's restart-
-    # loop rate limit entirely. They are emitted under [Unit] here so the
-    # rate limit actually applies. The burst budget still counts only FAILED
-    # triggers — successful recoveries exit 0 (D-38) and are not failures.
-    return f"""[Unit]
-Description=Restart scion-broker when control-channel goes stale
-# Rate limit: at most 5 failed triggers in 10 minutes (RESEARCH Pitfall 1).
-# Successful recoveries exit 0 and do NOT count toward the burst budget
-# (per CONTEXT D-38 + Task 04.1 exit-code matrix).
-StartLimitIntervalSec=600
-StartLimitBurst=5
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    removed: list[Path] = []
 
-[Service]
-Type=oneshot
-ExecStart={mnemosyne_bin} broker check-control-channel --restart-if-stale
+    for unit_name in (PATH_UNIT_NAME, RESTART_SERVICE_NAME):
+        unit_path = unit_dir / unit_name
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", unit_name],
+            check=False,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", unit_name],
+            check=False,
+        )
+        if unit_path.exists():
+            unit_path.unlink()
+            removed.append(unit_path)
 
-[Install]
-WantedBy=default.target
-"""
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    return removed
 
 
 def _find_mnemosyne_bin() -> Path:
@@ -728,33 +711,6 @@ def _find_mnemosyne_bin() -> Path:
     raise FileNotFoundError(
         "Could not find `mnemosyne` binary for Path-unit ExecStart"
     )
-
-
-def install_path_unit_watchdog() -> dict[str, Path]:
-    """SBR-3.3 D-17: emit Path-unit + triggered .service, daemon-reload, enable.
-
-    Returns dict mapping unit-name -> Path written.
-    Idempotent — re-running install rewrites the same files (Empiria values).
-    """
-    mnemosyne_bin = _find_mnemosyne_bin()
-    unit_dir = Path.home() / ".config" / "systemd" / "user"
-    unit_dir.mkdir(parents=True, exist_ok=True)
-
-    path_unit_path = unit_dir / PATH_UNIT_NAME
-    restart_service_path = unit_dir / RESTART_SERVICE_NAME
-
-    path_unit_path.write_text(render_path_unit())
-    restart_service_path.write_text(render_restart_service(mnemosyne_bin))
-
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-    subprocess.run(
-        ["systemctl", "--user", "enable", "--now", PATH_UNIT_NAME], check=False
-    )
-
-    return {
-        PATH_UNIT_NAME: path_unit_path,
-        RESTART_SERVICE_NAME: restart_service_path,
-    }
 
 
 # ---------------------------------------------------------------------------
