@@ -131,3 +131,45 @@ def test_apply_empiria_defaults_preflight_no_user_settings(tmp_path, monkeypatch
     from mnemosyne_cli.lib.broker import apply_empiria_defaults
     with pytest.raises((FileNotFoundError, RuntimeError)):
         apply_empiria_defaults()
+
+
+def test_grove_convergence_preserves_extra_keys(tmp_path, monkeypatch):
+    """Grove convergence is a field-level merge — extra operator keys survive.
+
+    Plan 33.3-09 (CR-01 gap-closure): compute_canonical_changes() must build
+    the grove target as dict(grove_data) with the two Empiria-managed keys
+    overwritten, not as the bare two-key dict from _build_grove_settings_target().
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _seed_user_settings(fake_home, FIXTURES_SETTINGS / "canonical.yaml")
+
+    # Grove with drifted default_template PLUS extra operator keys
+    grove_path = (
+        fake_home / ".scion" / "grove-configs" / "myproject__abc" / ".scion" / "settings.yaml"
+    )
+    grove_path.parent.mkdir(parents=True, exist_ok=True)
+    grove_path.write_text(
+        "default_template: default\n"
+        "default_harness_config: gemini\n"
+        "profiles:\n"
+        "  fast:\n"
+        "    model: claude-3-5-haiku-20241022\n"
+        "  thorough:\n"
+        "    model: claude-opus-4-5\n"
+        "custom_field: operator-configured-value\n"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    from mnemosyne_cli.lib.broker import apply_empiria_defaults
+    apply_empiria_defaults(dry_run=False)
+
+    data = yaml.safe_load(grove_path.read_text()) or {}
+    # Empiria-managed keys corrected
+    assert data["default_template"] == "empiria-agent", f"template wrong: {data}"
+    assert data["default_harness_config"] == "claude", f"harness wrong: {data}"
+    # Operator keys preserved verbatim
+    assert "profiles" in data, f"profiles lost after convergence: {data}"
+    assert data["profiles"]["fast"]["model"] == "claude-3-5-haiku-20241022"
+    assert data["profiles"]["thorough"]["model"] == "claude-opus-4-5"
+    assert data.get("custom_field") == "operator-configured-value", f"custom_field lost: {data}"
