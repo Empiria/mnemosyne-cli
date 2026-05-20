@@ -128,3 +128,28 @@ def test_get_protected_paths_resolves_under_patched_home(tmp_path, monkeypatch):
     # Two specific harness-config files:
     names = sorted(p.name for p in paths)
     assert names == [".claude.json", "config.yaml"]
+
+
+def test_atomic_write_no_orphan_on_failed_replace(tmp_path, monkeypatch):
+    """_atomic_write must leave no .mnemosyne-tmp-* orphan when os.replace fails.
+
+    Success path: target written, no orphan tempfile in parent dir.
+    Failure path: monkeypatched os.replace raises OSError — exception propagated
+    AND no .mnemosyne-tmp-* file remains in the parent directory.
+    """
+    from mnemosyne_cli.lib import broker
+
+    # --- Success path ---
+    target = tmp_path / "target.yaml"
+    broker._atomic_write(target, "content")
+    assert target.read_text() == "content"
+    orphans = list(tmp_path.glob(".mnemosyne-tmp-*"))
+    assert orphans == [], f"success path left orphan(s): {orphans}"
+
+    # --- Failure path: os.replace raises ---
+    target2 = tmp_path / "target2.yaml"
+    monkeypatch.setattr("mnemosyne_cli.lib.broker.os.replace", lambda src, dst: (_ for _ in ()).throw(OSError("simulated replace failure")))
+    with pytest.raises(OSError, match="simulated replace failure"):
+        broker._atomic_write(target2, "will fail")
+    orphans_after = list(tmp_path.glob(".mnemosyne-tmp-*"))
+    assert orphans_after == [], f"failure path left orphan(s): {orphans_after}"
