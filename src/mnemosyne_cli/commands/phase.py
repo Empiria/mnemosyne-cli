@@ -229,7 +229,7 @@ def update(
 ) -> None:
     """Apply a single lifecycle event to one phase.md card.
 
-    Invoked by the gsd-tools.cjs shim at each lifecycle touchpoint. Self-heals
+    Invoked by the gsd-sdk shim at each lifecycle touchpoint. Self-heals
     a missing phase.md by deriving from STATE.md + ROADMAP.md + git log (D-07).
 
     Silent no-op on resolution failure (D-08): exits 0 with stderr warning so

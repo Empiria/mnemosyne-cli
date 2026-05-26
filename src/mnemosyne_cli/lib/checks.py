@@ -46,7 +46,7 @@ def check_gsd_tools_on_path() -> CheckResult:
         return CheckResult(
             ok=False,
             message="gsd-tools not on PATH",
-            fix_cmd="npm install -g get-shit-done-cc",
+            fix_cmd="npm install -g @opengsd/get-shit-done-redux",
         )
     return CheckResult(ok=True, message=f"gsd-tools on PATH ({path})")
 
