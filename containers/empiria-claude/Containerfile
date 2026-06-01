@@ -71,12 +71,16 @@ ARG TARGETARCH
 ARG MNEMOSYNE_REV=unset
 USER root
 
-# GitHub CLI + ripgrep
+# GitHub CLI + ripgrep + openssh-client.
+# openssh-client provides the `ssh` binary git needs to push/pull over SSH
+# remotes (git@github.com:…) using the host ssh-agent forwarded to
+# /run/ssh-agent by the SCION template. It is NOT in the scion-claude base,
+# so agents could not use SSH git remotes without it.
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
     chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends gh ripgrep && \
+    apt-get install -y --no-install-recommends gh ripgrep openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 # CUDA 13 runtime libs for node-llama-cpp GPU acceleration (requires host driver >=590)
