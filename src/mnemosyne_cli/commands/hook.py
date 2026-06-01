@@ -54,14 +54,9 @@ def post_change() -> None:
     if not changed_files:
         return
     files = changed_files.splitlines()
-    ni = any(re.match(r"^containers/",f) for f in files)
     nq = any(re.match(r"^(technologies/|agents/|docs/|projects/.*\.md)",f) for f in files)
-    if ni and nq:
-        typer.echo(""); typer.echo("  ⟳ Container files and vault content changed — run: mnemosyne refresh"); typer.echo("")
-    elif ni:
-        typer.echo(""); typer.echo("  ⟳ Container files changed — run: mnemosyne refresh --skip-qmd"); typer.echo("")
-    elif nq:
-        typer.echo(""); typer.echo("  ⟳ Vault content changed — run: mnemosyne refresh --skip-images"); typer.echo("")
+    if nq:
+        typer.echo(""); typer.echo("  ⟳ Vault content changed — run: mnemosyne refresh"); typer.echo("")
 
 
 @app.command("context-monitor")

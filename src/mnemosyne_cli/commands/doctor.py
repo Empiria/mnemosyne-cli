@@ -924,63 +924,6 @@ def _build_checks(
 
     # --- Category: Freshness ---
 
-    def check_images_fresh() -> CheckResult:
-        """Check if local container images match the latest registry digest."""
-        import shutil
-
-        if not shutil.which("podman"):
-            return CheckResult(ok=True, message="podman not found (skipped)")
-
-        if not shutil.which("skopeo"):
-            return CheckResult(ok=True, message="skopeo not found -- cannot check registry freshness (skipped)")
-
-        stale = []
-        for name in ["mnemosyne-base", "mnemosyne-claude"]:
-            # Get local digests from the localhost/ tag that refresh creates.
-            # Podman stores multiple RepoDigests per image (e.g. manifest-list
-            # vs. image-manifest variants of the same content), so iterate the
-            # whole slice and substring-match below — picking only index 0
-            # produces false positives when the freshly-pulled digest lands at
-            # a higher index.
-            local_result = subprocess.run(
-                ["podman", "image", "inspect", f"localhost/{name}:latest",
-                 "--format", "{{range .RepoDigests}}{{.}} {{end}}"],
-                capture_output=True, text=True,
-            )
-            if local_result.returncode != 0:
-                stale.append(f"{name} (not pulled)")
-                continue
-            local_digest = local_result.stdout.strip() or None
-
-            # Get remote digest from registry
-            remote_result = subprocess.run(
-                ["skopeo", "inspect", "--format", "{{.Digest}}",
-                 f"docker://ghcr.io/empiria/{name}:latest"],
-                capture_output=True, text=True,
-                timeout=15,
-            )
-            if remote_result.returncode != 0:
-                # Registry unreachable — skip, don't fail
-                continue
-            remote_digest = remote_result.stdout.strip()
-
-            if local_digest is None or remote_digest not in local_digest:
-                stale.append(f"{name} (out of date with registry)")
-
-        if stale:
-            return CheckResult(
-                ok=False,
-                message=f"Container image(s) stale: {', '.join(stale)}",
-                fix_cmd="mnemosyne refresh --skip-qmd",
-            )
-        return CheckResult(ok=True, message="Container images up to date with registry")
-
-    checks.append(Check(
-        name="Container images up to date",
-        category="Freshness",
-        _check_fn=check_images_fresh,
-    ))
-
     def check_qmd_fresh() -> CheckResult:
         """Check if qmd index is older than vault content."""
         import shutil
@@ -996,7 +939,7 @@ def _build_checks(
             return CheckResult(
                 ok=False,
                 message="qmd status failed — index may not exist",
-                fix_cmd="mnemosyne refresh --skip-images",
+                fix_cmd="mnemosyne refresh",
             )
 
         # Find most recently modified .md file in the vault
@@ -1016,7 +959,7 @@ def _build_checks(
             return CheckResult(
                 ok=False,
                 message="qmd index not found",
-                fix_cmd="mnemosyne refresh --skip-images",
+                fix_cmd="mnemosyne refresh",
             )
 
         latest_index = max(f.stat().st_mtime for f in index_candidates)
@@ -1024,7 +967,7 @@ def _build_checks(
             return CheckResult(
                 ok=False,
                 message="Vault content modified since last qmd index update",
-                fix_cmd="mnemosyne refresh --skip-images",
+                fix_cmd="mnemosyne refresh",
             )
         return CheckResult(ok=True, message="qmd index up to date")
 

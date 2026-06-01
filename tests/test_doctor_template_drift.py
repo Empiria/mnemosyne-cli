@@ -101,8 +101,13 @@ def test_doctor_template_drift_skips_when_no_broker(tmp_path, monkeypatch):
     with patch(
         "mnemosyne_cli.commands.doctor.lib_vault.resolve_vault_path",
         return_value=tmp_path,
+    ), patch(
+        "mnemosyne_cli.commands.doctor.lib_scion_cache.find_broker_cache_root",
+        return_value=None,
     ):
         result = runner.invoke(app, ["doctor"])
-    # Skipped check is not a FAIL — exit 0 unless other checks fail
+    # No broker cache → the SCION Template Freshness category emits a single
+    # graceful-skip check named "SCION broker cache" that passes (ok=True),
+    # rather than a drift failure (D-19).
     output = result.stdout + result.stderr
-    assert "broker not on this machine" in output or "skip" in output.lower()
+    assert "SCION broker cache" in output
