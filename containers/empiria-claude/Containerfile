@@ -153,15 +153,20 @@ RUN test -x /opt/empiria/.venv/bin/mnemosyne \
 # plus a symlink at $HOME/.local/bin/claude that claude maintains itself
 # on auto-update. We install as the scion user with HOME=/opt/claude so
 # the binary lives outside the /home/scion mount overlay AND is writable
-# by the agent at runtime — when claude detects a new stable release, it
-# writes versions/<new>/ and re-targets /opt/claude/.local/bin/claude to
-# the new version with no operator action required.
+# by the agent at runtime — when claude detects a new release on its
+# channel, it writes versions/<new>/ and re-targets
+# /opt/claude/.local/bin/claude to the new version with no operator
+# action required.
 #
-# Channel: passing `stable` to install.sh tracks the stable release
-# channel (typically one week behind latest, skipping releases with
-# major regressions per Anthropic docs). The canonical .claude.json
-# seed sets autoUpdatesChannel:"stable" so subsequent auto-updates
-# also follow stable.
+# Channel: passing `latest` to install.sh tracks the latest release
+# channel. We deliberately track latest (not stable) so agents reach
+# new models the day they ship — stable lags ~a week and, concretely,
+# 2.1.150 (stable) did NOT carry opus-4-8 while 2.1.159 (latest) did,
+# leaving agents on the `opus` alias resolving to an older Opus than
+# the operator's host. The canonical .claude.json seed sets
+# autoUpdatesChannel:"latest" so subsequent auto-updates also follow
+# latest. Trade-off accepted: we forgo stable's regression-skipping
+# for host parity / model currency.
 #
 # History: an earlier Plan 33.2-03 iteration pinned a specific version
 # (2.1.110) with DISABLE_AUTOUPDATER=1, justified by the npm-global
@@ -181,7 +186,7 @@ USER scion
 # the shell environment, so install.sh would see HOME=/home/scion and put
 # the binary outside /opt/claude. `env HOME=… bash -c …` propagates HOME
 # to the bash that actually runs install.sh.
-RUN env HOME=/opt/claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash -s stable && /opt/claude/.local/bin/claude --version'
+RUN env HOME=/opt/claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash -s latest && /opt/claude/.local/bin/claude --version'
 USER root
 ENV PATH="/opt/claude/.local/bin:$PATH"
 RUN test "$(command -v claude)" = "/opt/claude/.local/bin/claude"
