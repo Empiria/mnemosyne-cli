@@ -916,3 +916,322 @@ def derive_scope_summary(written: list[str], deleted: list[str]) -> str:
     if top_dirs:
         return f"{total} {noun} ({', '.join(top_dirs)})"
     return f"{total} {noun}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 49 Plan 03 — run_publish orchestrator (Task 2a)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    """Result of a :func:`run_publish` call.
+
+    Attributes:
+        success:   True if the operation completed without error.
+        published: True if a new commit was created and pushed.
+        message:   Human-readable summary message.
+    """
+
+    success: bool
+    published: bool
+    message: str
+
+
+def run_publish(
+    *,
+    client: str,
+    force: bool,
+    skip_review_check: bool,
+    dry_run: bool,
+) -> "PublishResult":
+    """End-to-end publish orchestrator — §4.3 steps 5–9 pipeline.
+
+    Pipeline (49-RESEARCH Pattern 2):
+
+    1. Resolve vault_root (empiria) + load config. Load manifest.
+    2. ``check_review_gate`` (D-10); warn if skip_review_check.
+    3. ``check_target_registered`` (D-02); ``validate_publish_root_under_target``.
+    4. ``check_worktree_clean`` (D-02) — unless dry_run.
+    5. Load ``PUBLISHED.json``. ``detect_client_edits`` (D-04).
+    6. ``walk_manifest`` (Phase 48). Apply policy: refuse / warn / strip (D-49-12).
+    7. Compute ``current_sources``. ``compute_write_plan`` (D-05).
+    8. NO-OP GATE (D-06) — must precede all writes.
+    9. Stage + LICENSE + THIRD-PARTY + PUBLISHED.json (guarded by dry_run).
+    10. If dry_run → print plan, return published=False.
+    11. commit + deploy-key push (D-03).
+
+    Args:
+        client:             Client slug (e.g. ``"friendly-fox"``).
+        force:              Override detect-and-refuse (D-04).
+        skip_review_check:  Bypass licence review gate (loud warning; D-10).
+        dry_run:            Show the plan, write nothing to the target.
+
+    Returns:
+        :class:`PublishResult`.
+
+    Raises:
+        :class:`PublishError`: On any precondition or pipeline failure.
+    """
+    from rich.console import Console
+    from mnemosyne_cli.lib.vault import resolve_vault_path, _read_config
+    from mnemosyne_cli.share.manifest import load_manifest, ManifestError
+    from mnemosyne_cli.share.walker import walk_manifest
+
+    console = Console()
+    error_console = Console(stderr=True, style="bold red")
+
+    # -----------------------------------------------------------------------
+    # Step 1: Resolve vault_root + config; load manifest
+    # -----------------------------------------------------------------------
+    vault_root = resolve_vault_path()
+    config = _read_config()
+
+    manifest_path = vault_root / "clients" / client / "share-manifest.toml"
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        raise PublishError(f"run_publish: failed to load manifest: {exc}") from exc
+
+    # -----------------------------------------------------------------------
+    # Step 2: Review gate (D-10)
+    # -----------------------------------------------------------------------
+    check_review_gate(manifest, skip_review_check=skip_review_check)
+    if skip_review_check:
+        error_console.print(
+            "[bold yellow]WARNING:[/bold yellow] --skip-review-check is active — "
+            "the licence template has NOT been verified against the master agreement. "
+            "Proceeding anyway."
+        )
+
+    # -----------------------------------------------------------------------
+    # Step 3: Target registration + publish-root validation (D-02)
+    # -----------------------------------------------------------------------
+    target_vault_path = check_target_registered(manifest, config)
+    direct = manifest.direct or {}
+    target_subtree = direct.get("target_subtree", "imported/empiria")
+    publish_root = validate_publish_root_under_target(target_vault_path, target_subtree)
+
+    # -----------------------------------------------------------------------
+    # Step 4: Dirty-worktree check (D-02) — skipped in dry_run
+    # -----------------------------------------------------------------------
+    if not dry_run:
+        check_worktree_clean(target_vault_path, target_subtree)
+
+    # -----------------------------------------------------------------------
+    # Step 5: Load PUBLISHED.json + detect client edits (D-04)
+    # -----------------------------------------------------------------------
+    prior = load_published_json(publish_root)
+    detect_client_edits(publish_root, prior, force=force)
+
+    # -----------------------------------------------------------------------
+    # Step 6: Walk manifest + apply policy (Phase 48 walker)
+    # -----------------------------------------------------------------------
+    walk = walk_manifest(manifest, vault_root)
+    policy = manifest.policy
+
+    if policy == "refuse" and walk.has_breaches:
+        breach_list = "\n  ".join(walk.excluded + walk.breach)
+        raise PublishError(
+            f"run_publish: policy='refuse' — publish blocked by closure breaches "
+            f"(D-49-12):\n  {breach_list}"
+        )
+    elif policy == "warn" and walk.has_breaches:
+        breach_list = "\n  ".join(walk.excluded + walk.breach)
+        console.print(
+            f"[bold yellow]WARN:[/bold yellow] closure breaches detected (policy='warn'), "
+            f"proceeding with in_set only:\n  {breach_list}"
+        )
+
+    # Build breach_targets set for strip policy
+    breach_targets: set[str] = set()
+    if policy == "strip":
+        breach_targets = set(walk.excluded) | set(walk.breach)
+
+    # -----------------------------------------------------------------------
+    # Step 7: Compute current source hashes + write plan (D-05)
+    # -----------------------------------------------------------------------
+    current_sources: dict[str, str] = {}
+    for rel_str in walk.in_set:
+        source_abs = vault_root / rel_str
+        if source_abs.exists():
+            current_sources[rel_str] = content_hash(source_abs)
+
+    plan = compute_write_plan(current_sources, prior)
+
+    # -----------------------------------------------------------------------
+    # Step 8: NO-OP GATE (D-06) — must precede all writes
+    # -----------------------------------------------------------------------
+    if not plan.has_changes and prior is not None:
+        console.print("nothing to publish")
+        return PublishResult(
+            success=True,
+            published=False,
+            message="nothing to publish",
+        )
+
+    # -----------------------------------------------------------------------
+    # Step 9: Stage notes + render LICENSE + THIRD-PARTY + PUBLISHED.json
+    #         dry_run: no writes to target
+    # -----------------------------------------------------------------------
+    if dry_run:
+        # Show the plan without writing anything
+        console.print(
+            f"[bold]dry-run:[/bold] would write {len(plan.to_write)} file(s), "
+            f"delete {len(plan.to_delete)} file(s)"
+        )
+        if plan.to_write:
+            console.print("  to write: " + ", ".join(plan.to_write[:5]) +
+                          (" …" if len(plan.to_write) > 5 else ""))
+        if plan.to_delete:
+            console.print("  to delete: " + ", ".join(plan.to_delete[:5]) +
+                          (" …" if len(plan.to_delete) > 5 else ""))
+        if breach_targets:
+            console.print(f"  breach summary: {len(breach_targets)} cross-set link target(s) to strip")
+        return PublishResult(
+            success=True,
+            published=False,
+            message="dry-run complete",
+        )
+
+    # --- Not dry_run: actually write ---
+    license_block = manifest.license or {}
+    spdx_license_ref = license_block.get("spdx_license_ref", "LicenseRef-Unknown")
+    copyright_holder = license_block.get("copyright_holder", "Unknown")
+    year = datetime.now(timezone.utc).year
+    copyright_text = f"Copyright (c) {year} {copyright_holder}"
+    client_spdx_identifier = spdx_license_ref
+
+    in_set_paths: list[Path] = []
+    file_hashes: dict[str, dict] = {}
+
+    # Carry forward unchanged entries from prior
+    if prior:
+        file_hashes.update(prior.get("files", {}))
+
+    for rel_str in plan.to_write:
+        source_abs = vault_root / rel_str
+        if not source_abs.exists():
+            continue
+        # Preserve vault-relative path under target_subtree (Open Q2)
+        dest_abs = publish_root / rel_str
+        dest_abs.parent.mkdir(parents=True, exist_ok=True)
+
+        # Apply strip transform for 'strip' policy
+        if policy == "strip":
+            raw_content = source_abs.read_text(encoding="utf-8")
+            stripped_content = strip_cross_set_wikilinks(raw_content, breach_targets)
+            # Write stripped content to a tmp place, then stage_note reads it
+            # We need to stage using the stripped bytes approach:
+            import io
+            import frontmatter as _fm
+            post = _fm.loads(stripped_content)
+            source_spdx = post.metadata.get("spdx")
+            spdx_id = str(source_spdx) if source_spdx else client_spdx_identifier
+            post["SPDX-License-Identifier"] = spdx_id
+            post["SPDX-FileCopyrightText"] = copyright_text
+            staged_content = _fm.dumps(post)
+            dest_abs.write_text(staged_content, encoding="utf-8")
+            staged_bytes = staged_content.encode("utf-8")
+        else:
+            staged_bytes = stage_note(
+                source_abs,
+                dest_abs,
+                client_spdx_identifier=client_spdx_identifier,
+                copyright_text=copyright_text,
+            )
+
+        in_set_paths.append(source_abs)
+        src_hash = content_hash(source_abs)
+        out_hash = "sha256:" + hashlib.sha256(staged_bytes).hexdigest()
+        file_hashes[rel_str] = {
+            "source_hash": src_hash,
+            "output_hash": out_hash,
+        }
+
+    # Also populate in_set_paths for notes NOT in plan.to_write (unchanged)
+    for rel_str in walk.in_set:
+        if rel_str not in plan.to_write:
+            source_abs = vault_root / rel_str
+            if source_abs.exists():
+                in_set_paths.append(source_abs)
+
+    # Delete removed files from publish_root
+    for rel_str in plan.to_delete:
+        dest_abs = publish_root / rel_str
+        if dest_abs.exists():
+            dest_abs.unlink()
+        file_hashes.pop(rel_str, None)
+
+    # Render LICENSE.md
+    template_path_rel = license_block.get("template", "")
+    if template_path_rel:
+        template_path = vault_root / template_path_rel
+    else:
+        # Fallback: look in clients/{client}/license-template.md
+        template_path = vault_root / "clients" / client / "license-template.md"
+
+    if template_path.exists():
+        template_text = template_path.read_text(encoding="utf-8")
+        license_content = render_license(
+            template_text=template_text,
+            year=year,
+            copyright_holder=copyright_holder,
+            spdx_license_ref=spdx_license_ref,
+        )
+    else:
+        license_content = (
+            f"# License\n\nSPDX-License-Identifier: {spdx_license_ref}\n"
+            f"Copyright (c) {year} {copyright_holder}\n"
+        )
+    license_path = publish_root / "LICENSE.md"
+    license_path.parent.mkdir(parents=True, exist_ok=True)
+    license_path.write_text(license_content, encoding="utf-8")
+
+    # Render THIRD-PARTY-NOTICES.md
+    third_party = extract_third_party(in_set_paths, vault_root)
+    tpn_content = render_third_party_notices(third_party)
+    tpn_path = publish_root / "THIRD-PARTY-NOTICES.md"
+    tpn_path.write_text(tpn_content, encoding="utf-8")
+
+    # Build + write PUBLISHED.json
+    source_vault_sha = get_short_sha(vault_root)
+    manifest_hash = content_hash(manifest_path)
+    license_hash = "sha256:" + hashlib.sha256(license_content.encode("utf-8")).hexdigest()
+    tpn_hash = "sha256:" + hashlib.sha256(tpn_content.encode("utf-8")).hexdigest()
+
+    published_data = build_published_json(
+        source_vault_sha=source_vault_sha,
+        share_manifest_hash=manifest_hash,
+        license_md_hash=license_hash,
+        third_party_notices_hash=tpn_hash,
+        file_hashes=file_hashes,
+    )
+    write_published_json(publish_root, published_data)
+
+    # -----------------------------------------------------------------------
+    # Step 12 (already handled above for dry_run; this is the non-dry path)
+    # Step 13: commit + deploy-key push (D-03)
+    # -----------------------------------------------------------------------
+    # Resolve deploy key (D-01) — ONLY consumed by git_push_with_deploy_key
+    deploy_key_ref = direct.get("deploy_key_ref", "")
+    key_path = resolve_deploy_key(deploy_key_ref)
+
+    scope_summary = derive_scope_summary(plan.to_write, plan.to_delete)
+    commit_message = (
+        f"Empiria publish: {scope_summary}, source @ {source_vault_sha}"
+    )
+
+    # Stage and commit: target_subtree + PUBLISHED.json
+    git_commit(
+        target_vault_path,
+        [target_subtree],
+        commit_message,
+    )
+    git_push_with_deploy_key(target_vault_path, key_path)
+
+    return PublishResult(
+        success=True,
+        published=True,
+        message=f"Published: {scope_summary}, source @ {source_vault_sha}",
+    )
