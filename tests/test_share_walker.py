@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from mnemosyne_cli.share.manifest import load_manifest
+from mnemosyne_cli.share.manifest import load_manifest, validate_manifest_dict
 from mnemosyne_cli.share.walker import (
     AmbiguousLinkError,
     WalkResult,
@@ -209,3 +209,167 @@ def test_walk_result_carries_metadata(result, manifest):
     """WalkResult carries client_slug, policy, and manifest_path."""
     assert result.client_slug == "testclient"
     assert result.policy == "refuse"
+
+
+# ---------------------------------------------------------------------------
+# CR-01: malformed frontmatter must NOT silently hide a downstream breach
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_note_surfaces_parse_error_not_clean(tmp_path: Path):
+    """A note with malformed frontmatter is recorded in parse_errors (CR-01).
+
+    Layout: seed (in_set, tag share:test) -> [[bad]].  `bad.md` has a
+    malformed YAML frontmatter block (an unquoted [[...]] scalar value) so
+    frontmatter.load() raises.  If that failure were swallowed as "no links"
+    the walk would report CLEAN.  Instead it must surface as a parse error and
+    the result must be unsafe under refuse policy (T-48-05-01).
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "seed.md").write_text(
+        "---\ntags: [share:test]\n---\n# Seed\n\n[[bad]]\n"
+    )
+    # Malformed frontmatter: a double-colon mapping value (`a: b: c`) is not
+    # valid YAML and makes frontmatter.load() raise — this is the CR-01 trigger
+    # note whose own outbound link to the would-be breach we cannot see.
+    (vault / "bad.md").write_text(
+        "---\nrelated: secret: leak\n---\n# Bad\n\n[[secret-leak]]\n"
+    )
+    (vault / "secret-leak.md").write_text(
+        "---\ntags: []\n---\n# Secret Leak\n"
+    )
+
+    manifest = validate_manifest_dict({
+        "client": {"slug": "cr01-test", "mode": "direct"},
+        "direct": {"target_vault": "x"},
+        "include": {"paths": [], "tags": ["share:test"]},
+        "on_closure_breach": {"policy": "refuse"},
+    })
+
+    result = walk_manifest(manifest, vault)
+
+    # The unparseable note is surfaced, never silently dropped.
+    assert "bad.md" in result.parse_errors, (
+        f"expected 'bad.md' in parse_errors, got: {result.parse_errors}"
+    )
+    # A note we cannot parse makes a refuse-policy walk unsafe — NOT clean.
+    assert result.is_unsafe is True
+
+
+def test_malformed_note_does_not_report_clean_under_refuse(tmp_path: Path):
+    """A refuse-policy walk with a parse error must gate (is_unsafe), not pass.
+
+    Even with zero excluded/breach notes, the presence of an unparseable note
+    means the closure cannot be trusted — has_breaches may be False but
+    is_unsafe must be True so the doctor exit gate fails (CR-01)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "seed.md").write_text(
+        "---\ntags: [share:test]\n---\n# Seed\n\n[[bad]]\n"
+    )
+    (vault / "bad.md").write_text(
+        "---\nrelated: secret: leak\n---\n# Bad\n"
+    )
+
+    manifest = validate_manifest_dict({
+        "client": {"slug": "cr01b-test", "mode": "direct"},
+        "direct": {"target_vault": "x"},
+        "include": {"paths": [], "tags": ["share:test"]},
+        "on_closure_breach": {"policy": "refuse"},
+    })
+
+    result = walk_manifest(manifest, vault)
+    assert result.parse_errors, "parse failure must be surfaced, not swallowed"
+    assert result.is_unsafe is True
+
+
+# ---------------------------------------------------------------------------
+# CR-02: path-qualified link into a hidden (dot) directory must NOT resolve
+# ---------------------------------------------------------------------------
+
+
+def test_hidden_dir_link_not_resolved_into_closure(tmp_path: Path):
+    """A [[.hidden/secret]] link to a dot-directory file is out-of-universe.
+
+    Hidden directories are excluded everywhere (_vault_md_files); the
+    path-qualified branch of _resolve must apply the same guard (CR-02) so a
+    real file under a dot-dir never appears in in_set/excluded/breach."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "seed.md").write_text(
+        "---\ntags: [share:test]\n---\n# Seed\n\n[[.hidden/secret]]\n"
+    )
+    hidden = vault / ".hidden"
+    hidden.mkdir()
+    (hidden / "secret.md").write_text(
+        "---\ntags: []\n---\n# Secret under a dot-dir\n"
+    )
+
+    manifest = validate_manifest_dict({
+        "client": {"slug": "cr02-test", "mode": "direct"},
+        "direct": {"target_vault": "x"},
+        "include": {"paths": [], "tags": ["share:test"]},
+        "on_closure_breach": {"policy": "warn"},
+    })
+
+    result = walk_manifest(manifest, vault)
+
+    hidden_rel = ".hidden/secret.md"
+    assert hidden_rel not in result.in_set
+    assert hidden_rel not in result.excluded
+    assert hidden_rel not in result.breach
+    # No classified list should reference anything under the dot-dir.
+    all_classified = result.in_set + result.excluded + result.breach
+    assert not any(p.startswith(".hidden/") for p in all_classified), (
+        f"hidden-dir file leaked into closure: {all_classified}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# WR-01: an excluded note is a cut-point — closure does not traverse through it
+# ---------------------------------------------------------------------------
+
+
+def test_excluded_note_is_cut_point(tmp_path: Path):
+    """A -> excluded B -> C (C reachable ONLY via B): B excluded, C not a breach.
+
+    An excluded note will not be published, so its outbound links cannot leak
+    anything; the BFS must not expand through it (WR-01, exclude = cut-point).
+    B is still classified `excluded` (and still gates under D-11), but C — which
+    is reachable only through B — must NOT appear as a breach."""
+    vault = tmp_path / "vault"
+    (vault / "included").mkdir(parents=True)
+    (vault / "decision").mkdir(parents=True)
+    (vault / "deep").mkdir(parents=True)
+
+    # A: in_set (matches include.paths), links to excluded B.
+    (vault / "included" / "a.md").write_text(
+        "---\ntags: []\n---\n# A\n\n[[decision/b]]\n"
+    )
+    # B: under decision/ → matches exclude.paths → excluded; links to C.
+    (vault / "decision" / "b.md").write_text(
+        "---\ntags: []\n---\n# B (excluded)\n\n[[deep/c]]\n"
+    )
+    # C: reachable ONLY through excluded B.  Must not be pulled into the walk.
+    (vault / "deep" / "c.md").write_text(
+        "---\ntags: []\n---\n# C — only reachable via excluded B\n"
+    )
+
+    manifest = validate_manifest_dict({
+        "client": {"slug": "wr01-test", "mode": "direct"},
+        "direct": {"target_vault": "x"},
+        "include": {"paths": ["included/**"], "tags": []},
+        "exclude": {"paths": ["decision/**"]},
+        "on_closure_breach": {"policy": "warn"},
+    })
+
+    result = walk_manifest(manifest, vault)
+
+    assert "included/a.md" in result.in_set
+    # B is reached and classified excluded (still policy-actionable, D-11).
+    assert "decision/b.md" in result.excluded
+    # C is reachable ONLY through excluded B → cut-point → never visited.
+    assert "deep/c.md" not in result.breach
+    assert "deep/c.md" not in result.in_set
+    assert "deep/c.md" not in result.excluded

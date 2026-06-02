@@ -1945,12 +1945,16 @@ def _run_share_manifests(vault_path: Path, json_out: bool) -> bool:
             breach=result.breach,
             broken=result.broken,
             strip_candidates=result.strip_candidates,
+            parse_errors=result.parse_errors,
         )
         results.append(result)
 
         # D-17: refuse + has_breaches -> non-zero exit
+        # CR-01: refuse + unparseable note -> non-zero exit (a note we cannot
+        #   parse may hide a breach behind it; silent pass is the leak failure
+        #   mode, T-48-05-01).
         # D-18: broken never gates
-        if result.policy == "refuse" and result.has_breaches:
+        if result.policy == "refuse" and (result.has_breaches or result.is_unsafe):
             should_fail = True
 
     # ------------------------------------------------------------------
@@ -1970,6 +1974,7 @@ def _run_share_manifests(vault_path: Path, json_out: bool) -> bool:
                 "breach": r.breach,
                 "broken": r.broken,
                 "strip_candidates": [list(pair) for pair in r.strip_candidates],
+                "parse_errors": r.parse_errors,
             })
         # Include errors in JSON output
         for slug, msg in errors:
@@ -1983,18 +1988,27 @@ def _run_share_manifests(vault_path: Path, json_out: bool) -> bool:
                 "breach": [],
                 "broken": [],
                 "strip_candidates": [],
+                "parse_errors": [],
             })
         print(json.dumps(output))
     else:
         # D-16 default: human-readable grouped text, consistent with existing doctor output
         for r in results:
-            breach_status = "[red]BREACH[/red]" if r.has_breaches else "[green]CLEAN[/green]"
+            # CR-01: an unparseable note makes the result untrustworthy even if
+            # the classification lists look clean — surface it in the status.
+            if r.has_breaches:
+                status = "[red]BREACH[/red]"
+            elif r.is_unsafe:
+                status = "[red]UNSAFE[/red]"
+            else:
+                status = "[green]CLEAN[/green]"
             console.rule(
-                f"[bold]{r.client_slug}[/bold] — policy={r.policy} — {breach_status}"
+                f"[bold]{r.client_slug}[/bold] — policy={r.policy} — {status}"
             )
             console.print(
                 f"  in-set: {len(r.in_set)}  excluded: {len(r.excluded)}"
                 f"  breach: {len(r.breach)}  broken: {len(r.broken)}"
+                f"  parse-errors: {len(r.parse_errors)}"
             )
             if r.excluded:
                 console.print("  [yellow]Excluded (policy-actionable):[/yellow]")
@@ -2003,6 +2017,12 @@ def _run_share_manifests(vault_path: Path, json_out: bool) -> bool:
             if r.breach:
                 console.print("  [red]Closure breach:[/red]")
                 for path in sorted(r.breach):
+                    console.print(f"    {path}")
+            if r.parse_errors:
+                console.print(
+                    "  [red]Parse errors (cannot verify links — gated):[/red]"
+                )
+                for path in sorted(r.parse_errors):
                     console.print(f"    {path}")
             if r.broken:
                 console.print("  [dim]Broken links (hygiene, not gated):[/dim]")
@@ -2015,7 +2035,9 @@ def _run_share_manifests(vault_path: Path, json_out: bool) -> bool:
 
         # Trailing summary
         total = len(results) + len(errors)
-        fail_count = sum(1 for r in results if r.has_breaches) + len(errors)
+        fail_count = (
+            sum(1 for r in results if r.has_breaches or r.is_unsafe) + len(errors)
+        )
         console.print()
         if fail_count == 0:
             console.print(f"[green]All {total} manifest(s) clean.[/green]")
