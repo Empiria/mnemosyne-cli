@@ -35,6 +35,8 @@ from mnemosyne_cli.lib.symlinks import (
     remove_skill_symlink,
 )
 from mnemosyne_cli.lib.techstack import discover_tech_rules, parse_tech_stack
+from mnemosyne_cli.share.manifest import load_manifest, ManifestError
+from mnemosyne_cli.share.walker import walk_manifest, AmbiguousLinkError, WalkResult
 
 console = Console()
 error_console = Console(stderr=True, style="bold red")
@@ -1885,12 +1887,163 @@ def _components_apply_here(cwd: Path, vault_path: Path) -> bool:
     return rel == "projects/empiria/mnemosyne"
 
 
+def _run_share_manifests(vault_path: Path, json_out: bool) -> bool:
+    """Walk every clients/*/share-manifest.toml and render results.
+
+    Renders per-manifest grouped human-readable text (default) or a single JSON
+    array (--json).  Returns True iff the run should exit non-zero (D-17/D-18):
+    any manifest with policy="refuse" AND has_breaches=True, OR any
+    ManifestError/AmbiguousLinkError (hard failure — silent pass is the leak
+    failure mode, T-48-05-01).
+
+    Broken/dangling links never contribute to the exit gate (D-18).
+
+    Module-level (not a _check_fn) so tests can call it directly.
+    """
+    clients_dir = vault_path / "clients"
+    manifest_paths = sorted(clients_dir.glob("*/share-manifest.toml"))
+
+    results: list[WalkResult] = []
+    errors: list[tuple[str, str]] = []  # (client_slug_or_path, error_message)
+    should_fail = False
+
+    for manifest_path in manifest_paths:
+        client_slug = manifest_path.parent.name
+
+        # Load + validate manifest (D-19 strict validation)
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError as exc:
+            errors.append((client_slug, f"ManifestError: {exc}"))
+            should_fail = True
+            continue
+        except Exception as exc:
+            errors.append((client_slug, f"Unexpected error loading manifest: {exc}"))
+            should_fail = True
+            continue
+
+        # Walk the wikilink closure (dry-run, D-12)
+        try:
+            result = walk_manifest(manifest, vault_path)
+        except AmbiguousLinkError as exc:
+            errors.append((client_slug, f"AmbiguousLinkError: {exc}"))
+            should_fail = True
+            continue
+        except Exception as exc:
+            errors.append((client_slug, f"Unexpected error walking manifest: {exc}"))
+            should_fail = True
+            continue
+
+        # Set manifest_path on the result (walker leaves it None, caller sets it)
+        # WalkResult is frozen, so create a new one with manifest_path set
+        result = WalkResult(
+            client_slug=result.client_slug,
+            policy=result.policy,
+            manifest_path=manifest_path,
+            in_set=result.in_set,
+            excluded=result.excluded,
+            breach=result.breach,
+            broken=result.broken,
+            strip_candidates=result.strip_candidates,
+        )
+        results.append(result)
+
+        # D-17: refuse + has_breaches -> non-zero exit
+        # D-18: broken never gates
+        if result.policy == "refuse" and result.has_breaches:
+            should_fail = True
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
+    if json_out:
+        # D-16 --json: structured array for CI/compliance pipelines
+        output = []
+        for r in results:
+            output.append({
+                "client_slug": r.client_slug,
+                "policy": r.policy,
+                "manifest_path": str(r.manifest_path) if r.manifest_path else None,
+                "in_set": r.in_set,
+                "excluded": r.excluded,
+                "breach": r.breach,
+                "broken": r.broken,
+                "strip_candidates": [list(pair) for pair in r.strip_candidates],
+            })
+        # Include errors in JSON output
+        for slug, msg in errors:
+            output.append({
+                "client_slug": slug,
+                "error": msg,
+                "policy": None,
+                "manifest_path": None,
+                "in_set": [],
+                "excluded": [],
+                "breach": [],
+                "broken": [],
+                "strip_candidates": [],
+            })
+        print(json.dumps(output))
+    else:
+        # D-16 default: human-readable grouped text, consistent with existing doctor output
+        for r in results:
+            breach_status = "[red]BREACH[/red]" if r.has_breaches else "[green]CLEAN[/green]"
+            console.rule(
+                f"[bold]{r.client_slug}[/bold] — policy={r.policy} — {breach_status}"
+            )
+            console.print(
+                f"  in-set: {len(r.in_set)}  excluded: {len(r.excluded)}"
+                f"  breach: {len(r.breach)}  broken: {len(r.broken)}"
+            )
+            if r.excluded:
+                console.print("  [yellow]Excluded (policy-actionable):[/yellow]")
+                for path in sorted(r.excluded):
+                    console.print(f"    {path}")
+            if r.breach:
+                console.print("  [red]Closure breach:[/red]")
+                for path in sorted(r.breach):
+                    console.print(f"    {path}")
+            if r.broken:
+                console.print("  [dim]Broken links (hygiene, not gated):[/dim]")
+                for path in sorted(r.broken):
+                    console.print(f"    {path}")
+
+        for slug, msg in errors:
+            console.rule(f"[bold]{slug}[/bold] — [red]ERROR[/red]")
+            error_console.print(f"  {msg}")
+
+        # Trailing summary
+        total = len(results) + len(errors)
+        fail_count = sum(1 for r in results if r.has_breaches) + len(errors)
+        console.print()
+        if fail_count == 0:
+            console.print(f"[green]All {total} manifest(s) clean.[/green]")
+        else:
+            console.print(
+                f"[yellow]{total - fail_count}/{total} manifest(s) clean,[/yellow] "
+                f"[red]{fail_count} require attention.[/red]"
+            )
+
+    return should_fail
+
+
 def run(
     fix: bool = typer.Option(False, "--fix", help="Apply fixes with per-fix confirmation"),
     container: bool = typer.Option(
         False,
         "--container",
         help="Run in-container bootstrap checks (D-22) instead of host-codebase checks",
+    ),
+    share_manifests: bool = typer.Option(
+        False,
+        "--share-manifests",
+        help="Dry-run walk every clients/*/share-manifest.toml and report breaches (D-16/D-17/D-18)",
+    ),
+    json_out: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit structured JSON output (for use with --share-manifests, D-16)",
     ),
 ) -> None:
     """Validate project setup and report issues."""
@@ -1901,11 +2054,24 @@ def run(
         fix = False
     if isinstance(container, typer.models.OptionInfo):
         container = False
+    if isinstance(share_manifests, typer.models.OptionInfo):
+        share_manifests = False
+    if isinstance(json_out, typer.models.OptionInfo):
+        json_out = False
 
     cwd = Path.cwd()
 
     # Resolve vault path
     vault_path = lib_vault.resolve_vault_path()
+
+    # --share-manifests: take a different path from the normal checks (D-16).
+    # Runs the dry-run walker across every clients/*/share-manifest.toml and
+    # returns before the normal doctor check path — no interaction with --fix.
+    if share_manifests:
+        should_exit_nonzero = _run_share_manifests(vault_path, json_out=json_out)
+        if should_exit_nonzero:
+            raise typer.Exit(1)
+        return
 
     if container:
         # Container mode skips the git-repo requirement; _build_checks does
