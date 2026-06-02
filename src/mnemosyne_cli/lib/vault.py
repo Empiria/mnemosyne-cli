@@ -7,6 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
 import frontmatter
 import tomli_w
 import typer
@@ -303,7 +304,13 @@ def read_operational_home(vault_path: Path, project_rel: str) -> OperationalHome
     note_path = project_dir / f"{project_dir.name}.md"
     if not note_path.is_file():
         return None
-    oh = frontmatter.load(str(note_path)).metadata.get("operational_home")
+    try:
+        meta = frontmatter.load(str(note_path)).metadata
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"frontmatter in {note_path} is not valid YAML: {exc}"
+        ) from exc
+    oh = meta.get("operational_home")
     if oh is None:
         return None
     if not isinstance(oh, dict) or "vault" not in oh or "path" not in oh:

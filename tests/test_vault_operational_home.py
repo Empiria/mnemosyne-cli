@@ -114,6 +114,17 @@ class TestReadOperationalHome:
         assert result.vault == "friendly-fox-vault"
         assert result.path == "projects/infinite-worlds"
 
+    def test_structurally_broken_yaml_raises_value_error(self, tmp_path):
+        """Structurally broken YAML frontmatter raises ValueError, not yaml.YAMLError (CR-01)."""
+        vault = tmp_path / "vault"
+        project_dir = vault / "projects" / "friendly-fox" / "infinite-worlds"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        # Write a note with unclosed bracket — structurally invalid YAML
+        note = project_dir / "infinite-worlds.md"
+        note.write_text("---\npath: [unclosed\n---\n# Project\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="not valid YAML"):
+            lib_vault.read_operational_home(vault, "projects/friendly-fox/infinite-worlds")
+
     def test_slug_note_filename_convention(self, tmp_path):
         """Note path uses {dir}/{slug}.md convention (slug = directory basename)."""
         vault = tmp_path / "vault"
