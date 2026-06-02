@@ -42,17 +42,29 @@ from mnemosyne_cli.share.publish import (
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "publish_vault"
 
 
-def _make_vault(tmp_path: Path, client: str = "testclient") -> Path:
-    """Create a minimal source vault with a share-manifest and licence template."""
+def _make_vault(
+    tmp_path: Path,
+    client: str = "testclient",
+    extra_fixtures: list[str] | None = None,
+) -> Path:
+    """Create a minimal source vault with a share-manifest and licence template.
+
+    Args:
+        tmp_path:       pytest tmp_path fixture.
+        client:         Client slug (used for licence template directory).
+        extra_fixtures: Additional fixture-relative paths to copy into the vault.
+                        Used by tests that need breach targets for strip policy.
+    """
     vault = tmp_path / "empiria-vault"
     vault.mkdir(parents=True)
 
     # Copy in fixture notes
-    for rel in [
+    base_fixtures = [
         "technologies/anvil/reference/testing.md",
         "technologies/anvil/reference/forms.md",
         "technologies/python/reference/vendored-lib.md",
-    ]:
+    ]
+    for rel in base_fixtures + (extra_fixtures or []):
         src = FIXTURE_ROOT / rel
         dst = vault / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -787,4 +799,109 @@ def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     # No new commit
     assert _git_log_count(target_wc) == initial_commit_count, (
         "A commit was created during dry_run"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (j) test_strip_policy_removes_cross_set_links — CR-01 regression
+# ---------------------------------------------------------------------------
+
+
+def test_strip_policy_removes_cross_set_links(tmp_path: Path) -> None:
+    """policy='strip' must remove cross-set wikilinks from staged notes (CR-01).
+
+    The fixture testing.md contains [[technologies/secret/internal|the internal note]].
+    technologies/secret/internal.md exists in the vault but is NOT covered by the
+    include set (only technologies/anvil/reference/** is included), so the walker
+    classifies it as a breach.
+
+    The strip policy must:
+    - Normalise the .md-suffixed breach paths to extensionless form so they match
+      the wikilink base that strip_cross_set_wikilinks compares against (CR-01 fix).
+    - Write the staged note WITHOUT the [[technologies/secret/internal...]] wikilink
+      (replaced by alias text).
+
+    This test fails against the pre-fix wiring (breach_targets built with .md suffixes)
+    and passes after the fix.
+    """
+    import frontmatter as fm
+
+    # Include the breach-target note so the walker classifies it as 'breach'
+    # (if the file is absent it would be 'broken', not 'breach', and breach_targets
+    # would be empty — the strip path would be a no-op).
+    vault = _make_vault(
+        tmp_path,
+        client="testclient",
+        extra_fixtures=["technologies/secret/internal.md"],
+    )
+    target_wc, target_bare = _make_target_repo(tmp_path, "client-vault")
+    dummy_key = _dummy_key_path(tmp_path)
+
+    # Manifest with policy='strip' so cross-set links are flattened
+    toml = _make_manifest_toml(
+        client="testclient",
+        target_vault="client-vault",
+        deploy_key_ref="client-deploy",
+        target_subtree="imported/empiria",
+        policy="strip",
+    )
+    _write_manifest(vault, "testclient", toml)
+
+    secrets_path = tmp_path / "secrets.toml"
+    secrets_path.write_text(_make_secrets_toml("client-deploy", dummy_key))
+    config = _make_config_toml(vault, "client-vault", target_wc)
+
+    with (
+        patch("mnemosyne_cli.lib.vault.resolve_vault_path", return_value=vault),
+        patch("mnemosyne_cli.lib.vault._read_config", return_value=config),
+        patch("mnemosyne_cli.share.publish._SECRETS_PATH", secrets_path),
+        patch(
+            "mnemosyne_cli.share.publish.git_push_with_deploy_key",
+            lambda repo_path, kp: subprocess.run(
+                ["git", "push", "origin", "main"],
+                cwd=repo_path, check=True, capture_output=True,
+            ),
+        ),
+    ):
+        result = run_publish(
+            client="testclient",
+            force=False,
+            skip_review_check=False,
+            dry_run=False,
+        )
+
+    assert result.success is True
+    assert result.published is True
+
+    publish_root = target_wc / "imported" / "empiria"
+    staged_testing = publish_root / "technologies" / "anvil" / "reference" / "testing.md"
+    assert staged_testing.exists(), "testing.md not staged under strip policy"
+
+    staged_content = staged_testing.read_text(encoding="utf-8")
+
+    # The cross-set wikilink target must NOT appear in the staged output.
+    # Before CR-01 fix: breach_targets built with .md suffixes would never match
+    # the extensionless wikilink base, so the link leaked unchanged.
+    assert "technologies/secret/internal" not in staged_content, (
+        "Cross-set wikilink target 'technologies/secret/internal' leaked into "
+        "staged output — strip policy failed to remove it (CR-01 regression)"
+    )
+
+    # The alias text should be present (strip replaces [[target|alias]] with alias)
+    assert "the internal note" in staged_content, (
+        "Alias text from stripped wikilink not found — expected 'the internal note'"
+    )
+
+    # The in-set wikilink must be preserved
+    assert "[[technologies/anvil/reference/forms]]" in staged_content, (
+        "In-set wikilink was incorrectly stripped"
+    )
+
+    # SPDX frontmatter must be injected (shared code path with normal staging)
+    post = fm.load(str(staged_testing))
+    assert post.metadata.get("SPDX-License-Identifier") == "LicenseRef-Empiria-Test-2026", (
+        "SPDX-License-Identifier not injected in strip-path staged note"
+    )
+    assert "SPDX-FileCopyrightText" in post.metadata, (
+        "SPDX-FileCopyrightText not injected in strip-path staged note"
     )

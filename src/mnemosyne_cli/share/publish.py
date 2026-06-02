@@ -93,6 +93,7 @@ def stage_note(
     *,
     client_spdx_identifier: str,
     copyright_text: str,
+    content_override: str | None = None,
 ) -> bytes:
     """Copy *source_path* to *dest_path*, injecting SPDX frontmatter fields.
 
@@ -109,11 +110,18 @@ def stage_note(
         dest_path:             Path to write the staged copy.
         client_spdx_identifier: The client-level ``LicenseRef-*`` identifier.
         copyright_text:        The ``SPDX-FileCopyrightText`` value.
+        content_override:      If provided, parse frontmatter from this string
+                               instead of reading *source_path* from disk.  Used
+                               by the strip path to inject SPDX into already-
+                               transformed content without re-reading the source.
 
     Returns:
         The UTF-8-encoded bytes of the staged file content.
     """
-    post = frontmatter.load(str(source_path))
+    if content_override is not None:
+        post = frontmatter.loads(content_override)
+    else:
+        post = frontmatter.load(str(source_path))
 
     # D-12: third-party override — use the note's own spdx: value if present
     source_spdx = post.metadata.get("spdx")
@@ -1054,10 +1062,16 @@ def run_publish(
             f"proceeding with in_set only:\n  {breach_list}"
         )
 
-    # Build breach_targets set for strip policy
+    # Build breach_targets set for strip policy.
+    # walk.excluded and walk.breach are .md-suffixed vault-relative paths;
+    # strip_cross_set_wikilinks matches against the extensionless wikilink base,
+    # so we strip the .md suffix when building the set (CR-01 fix).
     breach_targets: set[str] = set()
     if policy == "strip":
-        breach_targets = set(walk.excluded) | set(walk.breach)
+        breach_targets = {
+            p[:-3] if p.endswith(".md") else p
+            for p in set(walk.excluded) | set(walk.breach)
+        }
 
     # -----------------------------------------------------------------------
     # Step 7: Compute current source hashes + write plan (D-05)
@@ -1134,22 +1148,18 @@ def run_publish(
         dest_abs = publish_root / rel_str
         dest_abs.parent.mkdir(parents=True, exist_ok=True)
 
-        # Apply strip transform for 'strip' policy
+        # Apply strip transform for 'strip' policy, then stage via stage_note
+        # so both paths share a single SPDX-injection code path (WR-03).
         if policy == "strip":
             raw_content = source_abs.read_text(encoding="utf-8")
             stripped_content = strip_cross_set_wikilinks(raw_content, breach_targets)
-            # Write stripped content to a tmp place, then stage_note reads it
-            # We need to stage using the stripped bytes approach:
-            import io
-            import frontmatter as _fm
-            post = _fm.loads(stripped_content)
-            source_spdx = post.metadata.get("spdx")
-            spdx_id = str(source_spdx) if source_spdx else client_spdx_identifier
-            post["SPDX-License-Identifier"] = spdx_id
-            post["SPDX-FileCopyrightText"] = copyright_text
-            staged_content = _fm.dumps(post)
-            dest_abs.write_text(staged_content, encoding="utf-8")
-            staged_bytes = staged_content.encode("utf-8")
+            staged_bytes = stage_note(
+                source_abs,
+                dest_abs,
+                client_spdx_identifier=client_spdx_identifier,
+                copyright_text=copyright_text,
+                content_override=stripped_content,
+            )
         else:
             staged_bytes = stage_note(
                 source_abs,
