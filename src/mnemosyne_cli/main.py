@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import typer
 
-from mnemosyne_cli.commands import add, broker, component, config, doctor, generate, hook, init, merge_driver, phase, refresh, shellenv, status, statusline_cmd, vault_cmd
+from mnemosyne_cli.commands import add, broker, component, config, doctor, generate, hook, init, merge_driver, phase, refresh, shellenv, status, statusline_cmd, tech_publish, vault_cmd
 
 app = typer.Typer(
     name="mnemosyne",
@@ -27,6 +27,7 @@ app.add_typer(broker.app, name="broker", help="Manage the SCION broker service f
 app.add_typer(phase.app, name="phase", help="Inspect and maintain phase.md cards.")
 app.command("shellenv")(shellenv.run)
 app.command("statusline")(statusline_cmd.run)
+app.command("tech-publish")(tech_publish.run)
 
 if __name__ == "__main__":
     app()
