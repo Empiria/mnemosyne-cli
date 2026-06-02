@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import tomllib
 from dataclasses import dataclass
@@ -636,7 +637,15 @@ def resolve_deploy_key(deploy_key_ref: str) -> Path:
             f"[deploy_keys]\n"
             f'{deploy_key_ref} = "/path/to/ssh/private/key"\n'
         )
-    return Path(raw).expanduser().resolve()
+    key_path = Path(raw).expanduser().resolve()
+    if not key_path.is_file():
+        raise PublishError(
+            f"resolve_deploy_key: the key file for ref '{deploy_key_ref}' does not "
+            f"exist or is not a regular file.\n"
+            f"Check the [deploy_keys] entry in {_SECRETS_PATH} and ensure the path "
+            f"points to a valid SSH private key file."
+        )
+    return key_path
 
 
 def check_review_gate(manifest, *, skip_review_check: bool) -> None:
@@ -858,8 +867,10 @@ def git_push_with_deploy_key(repo_path: Path, key_path: Path) -> None:
     """
     env = os.environ.copy()
     # GIT_SSH_COMMAND is the ONLY consumer of key_path (T-49-03-01).
+    # shlex.quote ensures paths with spaces or shell metacharacters are safe
+    # when git passes this string to /bin/sh -c.
     env["GIT_SSH_COMMAND"] = (
-        f"ssh -i {key_path} -o StrictHostKeyChecking=accept-new"
+        f"ssh -i {shlex.quote(str(key_path))} -o StrictHostKeyChecking=accept-new"
     )
     subprocess.run(
         ["git", "push", "origin", "main"],
