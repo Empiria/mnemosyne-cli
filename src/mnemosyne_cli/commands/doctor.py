@@ -204,14 +204,17 @@ def _build_checks(
 
     # --- Read operational_home once (used by OH checks below) ---
     # read_operational_home returns None when absent; raises ValueError when malformed.
-    # We surface malformed frontmatter as a FAILing check rather than letting
-    # _build_checks raise (Plan Action: handle ValueError inline).
+    # We surface any read failure as a FAILing check rather than letting an exception
+    # escape _build_checks and abort the entire doctor run (WR-01).
     _oh_error: str | None = None
     try:
         _oh = lib_vault.read_operational_home(vault_path, vault_project) if vault_project else None
     except ValueError as exc:
         _oh = None
         _oh_error = str(exc)
+    except Exception as exc:  # OSError, PermissionError, etc. — never abort the doctor
+        _oh = None
+        _oh_error = f"could not read engagement record: {exc}"
 
     # --- Client-codebase-only checks (skipped when running from the vault) ---
 

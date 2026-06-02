@@ -260,6 +260,34 @@ def test_oh_empiria_unregistered_skips(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_oh_malformed_engagement_record_does_not_raise(tmp_path, monkeypatch):
+    """WR-01: a malformed engagement record must NOT raise out of _build_checks.
+
+    Even when read_operational_home raises (YAML parse error, OSError, etc.),
+    _build_checks must return a list of checks rather than propagating the exception.
+    """
+    vault_path, project_path, vault_project_path = _setup_env(tmp_path)
+
+    # Write an engagement note with structurally broken YAML frontmatter (CR-01 trigger)
+    slug = vault_project_path.name
+    note = vault_project_path / f"{slug}.md"
+    note.write_text("---\npath: [unclosed\n---\n# Project\n", encoding="utf-8")
+
+    config_path = _make_config_toml(tmp_path, {"empiria": str(vault_path)})
+    monkeypatch.setattr(lib_vault, "_CONFIG_PATH", config_path)
+
+    # Wire .planning so resolve_vault_project returns a non-None project_rel
+    planning_link = project_path / ".planning"
+    if not planning_link.exists() and not planning_link.is_symlink():
+        planning_link.symlink_to(vault_project_path / "gsd-planning")
+
+    git_dir = project_path / ".git"
+
+    # Must not raise — must return a list (possibly with a failing OH check)
+    checks = doctor._build_checks(project_path, vault_path, git_dir)
+    assert isinstance(checks, list), "_build_checks must return a list, not raise"
+
+
 def test_oh_path_traversal_fails(tmp_path, monkeypatch):
     """Security V5/V12: an oh.path that escapes the OH vault root is flagged."""
     vault_path, project_path, vault_project_path = _setup_env(tmp_path)
