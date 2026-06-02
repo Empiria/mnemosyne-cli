@@ -76,7 +76,7 @@ def extract_wikilinks(content: str) -> list[str]:
     return results
 
 
-def extract_frontmatter_wikilinks(metadata: dict) -> list[str]:
+def extract_frontmatter_wikilinks(metadata: dict[str, object]) -> list[str]:
     """Return wikilink targets found in frontmatter scalar/list string values.
 
     Vault taxonomy encodes relationships in frontmatter as string values
