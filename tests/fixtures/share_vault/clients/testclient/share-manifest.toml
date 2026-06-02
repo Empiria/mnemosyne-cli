@@ -1,0 +1,19 @@
+[client]
+slug = "testclient"
+display = "Test Client"
+mode = "direct"
+
+[direct]
+target_vault = "testclient-vault"
+target_subtree = "imported/empiria"
+deploy_key_ref = "testclient-deploy"
+
+[include]
+paths = ["technologies/demo/reference/**"]
+tags = ["share:test"]
+
+[exclude]
+paths = ["**/decision/**"]
+
+[on_closure_breach]
+policy = "refuse"
