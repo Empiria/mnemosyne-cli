@@ -39,7 +39,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -569,3 +572,347 @@ def detect_client_edits(
         )
 
     return edited
+
+
+# ---------------------------------------------------------------------------
+# Phase 49 Plan 03 — preconditions, deploy-key resolution, git helpers
+# ---------------------------------------------------------------------------
+
+_SECRETS_PATH = Path("~/.config/mnemosyne/secrets.toml").expanduser()
+
+
+def resolve_deploy_key(deploy_key_ref: str) -> Path:
+    """Resolve a deploy-key reference to an absolute filesystem path.
+
+    Reads ``~/.config/mnemosyne/secrets.toml`` and looks up
+    ``data["deploy_keys"][deploy_key_ref]``.
+
+    **Security (T-49-03-01):** The resolved path is returned as a ``Path``
+    object; it MUST be used ONLY in ``GIT_SSH_COMMAND``.  It is NEVER written
+    to any vault file, NEVER passed to ``print``/``console``/``error_console``,
+    and NEVER written to any log.
+
+    Args:
+        deploy_key_ref: The symbolic key reference from ``[direct].deploy_key_ref``
+                        in the share-manifest.
+
+    Returns:
+        Absolute ``Path`` to the SSH private key file.
+
+    Raises:
+        ``PublishError`` with an actionable message if ``secrets.toml`` is
+        missing or if ``deploy_key_ref`` is absent from ``[deploy_keys]``.
+    """
+    if not _SECRETS_PATH.exists():
+        raise PublishError(
+            f"resolve_deploy_key: secrets.toml not found at {_SECRETS_PATH}.\n"
+            f"Create it with the following TOML block:\n\n"
+            f"[deploy_keys]\n"
+            f'{deploy_key_ref} = "/path/to/ssh/private/key"\n'
+        )
+    try:
+        with open(_SECRETS_PATH, "rb") as fh:
+            data = tomllib.load(fh)
+    except Exception as exc:
+        raise PublishError(
+            f"resolve_deploy_key: failed to parse {_SECRETS_PATH}: {exc}"
+        ) from exc
+
+    deploy_keys = data.get("deploy_keys", {})
+    raw = deploy_keys.get(deploy_key_ref)
+    if not raw:
+        raise PublishError(
+            f"resolve_deploy_key: key ref '{deploy_key_ref}' not found in "
+            f"{_SECRETS_PATH} [deploy_keys].\n"
+            f"Add the following to {_SECRETS_PATH}:\n\n"
+            f"[deploy_keys]\n"
+            f'{deploy_key_ref} = "/path/to/ssh/private/key"\n'
+        )
+    return Path(raw).expanduser().resolve()
+
+
+def check_review_gate(manifest, *, skip_review_check: bool) -> None:
+    """Enforce the licence-template review precondition (D-10).
+
+    Reads ``manifest.license["license_template_reviewed_at"]``.  If absent or
+    empty and ``skip_review_check`` is False, raises ``PublishError``.
+    If ``skip_review_check`` is True, the gate is bypassed — callers MUST emit
+    a loud warning after calling this function.
+
+    Args:
+        manifest:           Validated :class:`~mnemosyne_cli.share.manifest.ShareManifest`.
+        skip_review_check:  If True, bypass the gate (loud-warning path).
+
+    Raises:
+        ``PublishError`` if the review field is absent/empty and
+        ``skip_review_check`` is False.
+    """
+    if skip_review_check:
+        return
+
+    license_block = manifest.license or {}
+    reviewed_at = license_block.get("license_template_reviewed_at")
+    if not reviewed_at:
+        raise PublishError(
+            "check_review_gate: the share-manifest [license] block is missing "
+            "'license_template_reviewed_at:' (D-10).\n"
+            "Review the licence template against the master agreement and add:\n\n"
+            "  [license]\n"
+            "  license_template_reviewed_at = \"YYYY-MM-DD\"\n\n"
+            "Or pass --skip-review-check to bypass (loud warning will be emitted)."
+        )
+
+
+def check_target_registered(manifest, config: dict) -> Path:
+    """Verify the target vault is registered and cross-vault write is permitted (D-02).
+
+    Resolves ``manifest.direct["target_vault"]`` against the ``[vaults.*]``
+    registry in *config*, then asserts that the ``empiria`` vault
+    ``can_read`` the target (or the rule grants write access).
+
+    Args:
+        manifest:   Validated :class:`~mnemosyne_cli.share.manifest.ShareManifest`.
+        config:     Full config dict (as returned by ``lib.vault._read_config()``).
+
+    Returns:
+        Absolute :class:`Path` to the target vault's local directory.
+
+    Raises:
+        ``PublishError`` if the vault is unregistered or the cross-vault rule
+        does not permit the write.
+    """
+    from mnemosyne_cli.lib.vault import vault_by_name, can_read as vault_can_read
+
+    direct = manifest.direct or {}
+    target_vault_name = direct.get("target_vault", "")
+    if not target_vault_name:
+        raise PublishError(
+            "check_target_registered: manifest [direct].target_vault is missing."
+        )
+
+    vc = vault_by_name(target_vault_name)
+    if vc is None:
+        raise PublishError(
+            f"check_target_registered: target vault '{target_vault_name}' is not "
+            f"registered in config.toml [vaults.*] (D-02).\n"
+            f"Register it with:\n"
+            f"  mnemosyne vault add {target_vault_name} /path/to/local/clone"
+        )
+
+    # Cross-vault authorisation: empiria must be allowed to read/write target
+    if not vault_can_read("empiria", target_vault_name):
+        raise PublishError(
+            f"check_target_registered: cross-vault write not authorised — "
+            f"config.toml [[vault_rules]] does not grant 'empiria' can_read "
+            f"'{target_vault_name}' (D-02 / security).\n"
+            f"Add to ~/.config/mnemosyne/config.toml:\n\n"
+            f"[[vault_rules]]\n"
+            f'from = "empiria"\n'
+            f'can_read = ["{target_vault_name}"]\n'
+        )
+
+    return vc.path.expanduser().resolve()
+
+
+def check_worktree_clean(target_vault_path: Path, subtree: str) -> None:
+    """Refuse to publish if the target repo has uncommitted changes outside the subtree (D-02).
+
+    Runs ``git status --porcelain`` in *target_vault_path*; any path NOT under
+    *subtree* (and not ``PUBLISHED.json``) is a blocking dirty file.
+
+    Args:
+        target_vault_path: Absolute path to the target vault's local clone.
+        subtree:           Vault-relative publish subtree (e.g. ``"imported/empiria"``).
+
+    Raises:
+        ``PublishError`` listing any dirty paths outside the subtree.
+    """
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=target_vault_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    prefix = subtree.rstrip("/") + "/"
+    dirty_outside: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        # porcelain format: "XY path" (first two chars are status, then space)
+        path_part = line[3:].strip()
+        # Strip rename arrow (e.g. "old -> new") — use the destination path
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1]
+        if path_part.startswith(prefix):
+            continue
+        dirty_outside.append(path_part)
+    if dirty_outside:
+        paths_listed = "\n  ".join(dirty_outside)
+        raise PublishError(
+            f"check_worktree_clean: target vault at {target_vault_path} has "
+            f"uncommitted changes outside the publish subtree '{subtree}' (D-02):\n"
+            f"  {paths_listed}\n"
+            f"Commit or stash those changes before publishing."
+        )
+
+
+def validate_publish_root_under_target(target_vault_path: Path, subtree: str) -> Path:
+    """Compute and validate the publish root is inside the target vault (path-traversal guard).
+
+    Args:
+        target_vault_path: Absolute path to the target vault root.
+        subtree:           Vault-relative publish subtree (e.g. ``"imported/empiria"``).
+
+    Returns:
+        Resolved absolute :class:`Path` to the publish root.
+
+    Raises:
+        ``PublishError`` if the resolved path escapes the target vault root
+        (e.g. a ``../`` traversal attempt).
+    """
+    resolved_vault = target_vault_path.resolve()
+    publish_root = (resolved_vault / subtree).resolve()
+    if not (publish_root == resolved_vault or publish_root.is_relative_to(resolved_vault)):
+        raise PublishError(
+            f"validate_publish_root_under_target: resolved publish root "
+            f"{publish_root} is OUTSIDE the target vault {resolved_vault}. "
+            f"Possible path traversal via subtree='{subtree}' — aborting."
+        )
+    return publish_root
+
+
+def get_short_sha(repo_path: Path) -> str:
+    """Return the short (7-char) git SHA of HEAD for *repo_path*.
+
+    Args:
+        repo_path: Path to the git repository root.
+
+    Returns:
+        Short hex SHA string (e.g. ``"abc1234"``).
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def git_commit(repo_path: Path, paths: list[str], message: str) -> None:
+    """Stage *paths* and create a git commit in *repo_path*.
+
+    Args:
+        repo_path: Working directory for the commit (the target vault root).
+        paths:     List of relative paths to stage (``git add``).
+        message:   Commit message.
+    """
+    subprocess.run(
+        ["git", "add", "--"] + paths,
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def git_push_with_deploy_key(repo_path: Path, key_path: Path) -> None:
+    """Push ``origin main`` using a deploy key via ``GIT_SSH_COMMAND`` (D-01/D-03).
+
+    The deploy key path is injected ONLY into the subprocess environment as
+    ``GIT_SSH_COMMAND``.  It is NEVER logged, printed, or written to any file.
+    ``-o StrictHostKeyChecking=accept-new`` is included so the first push to a
+    fresh clone succeeds without interactive host-key confirmation (Finding 2).
+
+    Args:
+        repo_path: Working directory for the push (the target vault root).
+        key_path:  Absolute path to the SSH private key file (T-49-03-01).
+    """
+    env = os.environ.copy()
+    # GIT_SSH_COMMAND is the ONLY consumer of key_path (T-49-03-01).
+    env["GIT_SSH_COMMAND"] = (
+        f"ssh -i {key_path} -o StrictHostKeyChecking=accept-new"
+    )
+    subprocess.run(
+        ["git", "push", "origin", "main"],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def is_worktree_dirty_outside(repo_path: Path, subtree: str) -> list[str]:
+    """Return a list of dirty paths outside *subtree* in *repo_path*.
+
+    Equivalent to ``check_worktree_clean`` but returns paths rather than
+    raising, for use in places that need the list directly.
+
+    Args:
+        repo_path: Path to the git repository.
+        subtree:   Vault-relative publish subtree prefix.
+
+    Returns:
+        List of dirty path strings outside *subtree*.
+    """
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    prefix = subtree.rstrip("/") + "/"
+    dirty_outside: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        path_part = line[3:].strip()
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1]
+        if path_part.startswith(prefix):
+            continue
+        dirty_outside.append(path_part)
+    return dirty_outside
+
+
+def derive_scope_summary(written: list[str], deleted: list[str]) -> str:
+    """Build a human-readable commit-message scope summary.
+
+    Produces something like ``"3 files (technologies, clients)"`` — file count
+    plus the top-3 top-level directories touched, for use in the structured
+    commit message ``"Empiria publish: {scope_summary}, source @ {sha}"``.
+
+    Args:
+        written:  List of output-relative paths that were written.
+        deleted:  List of output-relative paths that were deleted.
+
+    Returns:
+        A short summary string.
+    """
+    all_paths = written + deleted
+    total = len(all_paths)
+    # Collect distinct top-level directory names
+    top_dirs: list[str] = []
+    seen: set[str] = set()
+    for p in all_paths:
+        parts = p.split("/")
+        top = parts[0] if parts else ""
+        if top and top not in seen:
+            seen.add(top)
+            top_dirs.append(top)
+    top_dirs = sorted(top_dirs)[:3]
+    noun = "file" if total == 1 else "files"
+    if top_dirs:
+        return f"{total} {noun} ({', '.join(top_dirs)})"
+    return f"{total} {noun}"
