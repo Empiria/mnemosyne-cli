@@ -9,6 +9,7 @@ dependencies = [
     "python-frontmatter>=1.1.0",
     "packaging>=21.0",
     "PyYAML>=6.0",
+    "pathspec>=0.12",
 ]
 
 [project.scripts]
