@@ -731,6 +731,40 @@ def check_target_registered(manifest, config: dict) -> Path:
     return vc.path.expanduser().resolve()
 
 
+def is_worktree_dirty_outside(repo_path: Path, subtree: str) -> list[str]:
+    """Return a list of dirty paths outside *subtree* in *repo_path*.
+
+    Used by :func:`check_worktree_clean` to determine whether blocking dirty
+    files exist outside the publish subtree.
+
+    Args:
+        repo_path: Path to the git repository.
+        subtree:   Vault-relative publish subtree prefix.
+
+    Returns:
+        List of dirty path strings outside *subtree*.
+    """
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    prefix = subtree.rstrip("/") + "/"
+    dirty_outside: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        path_part = line[3:].strip()
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1]
+        if path_part.startswith(prefix):
+            continue
+        dirty_outside.append(path_part)
+    return dirty_outside
+
+
 def check_worktree_clean(target_vault_path: Path, subtree: str) -> None:
     """Refuse to publish if the target repo has uncommitted changes outside the subtree (D-02).
 
@@ -744,26 +778,7 @@ def check_worktree_clean(target_vault_path: Path, subtree: str) -> None:
     Raises:
         ``PublishError`` listing any dirty paths outside the subtree.
     """
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=target_vault_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    prefix = subtree.rstrip("/") + "/"
-    dirty_outside: list[str] = []
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
-        # porcelain format: "XY path" (first two chars are status, then space)
-        path_part = line[3:].strip()
-        # Strip rename arrow (e.g. "old -> new") — use the destination path
-        if " -> " in path_part:
-            path_part = path_part.split(" -> ", 1)[1]
-        if path_part.startswith(prefix):
-            continue
-        dirty_outside.append(path_part)
+    dirty_outside = is_worktree_dirty_outside(target_vault_path, subtree)
     if dirty_outside:
         paths_listed = "\n  ".join(dirty_outside)
         raise PublishError(
@@ -882,40 +897,6 @@ def git_push_with_deploy_key(repo_path: Path, key_path: Path) -> None:
     )
 
 
-def is_worktree_dirty_outside(repo_path: Path, subtree: str) -> list[str]:
-    """Return a list of dirty paths outside *subtree* in *repo_path*.
-
-    Equivalent to ``check_worktree_clean`` but returns paths rather than
-    raising, for use in places that need the list directly.
-
-    Args:
-        repo_path: Path to the git repository.
-        subtree:   Vault-relative publish subtree prefix.
-
-    Returns:
-        List of dirty path strings outside *subtree*.
-    """
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=repo_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    prefix = subtree.rstrip("/") + "/"
-    dirty_outside: list[str] = []
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
-        path_part = line[3:].strip()
-        if " -> " in path_part:
-            path_part = path_part.split(" -> ", 1)[1]
-        if path_part.startswith(prefix):
-            continue
-        dirty_outside.append(path_part)
-    return dirty_outside
-
-
 def derive_scope_summary(written: list[str], deleted: list[str]) -> str:
     """Build a human-readable commit-message scope summary.
 
@@ -1024,6 +1005,17 @@ def run_publish(
         raise PublishError(f"run_publish: failed to load manifest: {exc}") from exc
 
     # -----------------------------------------------------------------------
+    # WR-06: Mode gate — only direct mode is implemented in this command
+    # -----------------------------------------------------------------------
+    if manifest.mode != "direct":
+        raise PublishError(
+            f"run_publish: manifest mode is '{manifest.mode}', but this command "
+            f"only supports mode='direct'.\n"
+            f"The intermediary-mode publish flow is not yet implemented — use a "
+            f"direct-mode manifest or wait for the intermediary command."
+        )
+
+    # -----------------------------------------------------------------------
     # Step 2: Review gate (D-10)
     # -----------------------------------------------------------------------
     check_review_gate(manifest, skip_review_check=skip_review_check)
@@ -1107,9 +1099,12 @@ def run_publish(
             message="nothing to publish",
         )
 
-    # When force=True with client edits, we need to re-write all edited files
+    # When force=True with client edits, we need to re-write all edited files.
+    # Intentional: rewriting ALL in-set files on --force restores every file to
+    # canonical Empiria content, not just the one the client touched.  This is
+    # the desired behaviour — a force-publish is a full authoritative overwrite,
+    # not a selective patch (WR-05).
     if force and client_edits and not plan.has_changes:
-        # Treat all in-set files as needing re-write to overwrite client edits
         plan = compute_write_plan(current_sources, None)
 
     # -----------------------------------------------------------------------
@@ -1260,14 +1255,41 @@ def run_publish(
         f"Empiria publish: {scope_summary}, source @ {source_vault_sha}"
     )
 
-    # Stage and commit: target_subtree + PUBLISHED.json
+    # Build the explicit stage list: only the files the pipeline wrote/deleted
+    # plus the three generated artefacts.  Staging the whole subtree directory
+    # would sweep any pre-existing client stray files into the Empiria commit
+    # (WR-02).
+    subtree_prefix = target_subtree.rstrip("/") + "/"
+    stage_paths: list[str] = (
+        [subtree_prefix + p for p in plan.to_write]
+        + [subtree_prefix + p for p in plan.to_delete]
+        + [
+            subtree_prefix + "LICENSE.md",
+            subtree_prefix + "THIRD-PARTY-NOTICES.md",
+            subtree_prefix + "PUBLISHED.json",
+        ]
+    )
+
     committed = git_commit(
         target_vault_path,
-        [target_subtree],
+        stage_paths,
         commit_message,
     )
     if committed:
-        git_push_with_deploy_key(target_vault_path, key_path)
+        # WR-01: wrap push failure so operators get an actionable message
+        # (raw CalledProcessError bypasses the Typer except PublishError handler).
+        # The local commit is intentionally preserved — it can be pushed manually.
+        try:
+            git_push_with_deploy_key(target_vault_path, key_path)
+        except subprocess.CalledProcessError as exc:
+            raise PublishError(
+                f"run_publish: the commit was created in the target repo but the "
+                f"push to origin failed (exit {exc.returncode}).\n"
+                f"The commit is still present in the local target clone — push it "
+                f"manually once the remote is reachable:\n"
+                f"  cd <target-vault> && git push origin main\n"
+                f"stderr: {exc.stderr}"
+            ) from exc
     else:
         # Nothing actually changed on disk — treat as no-op
         return PublishResult(
