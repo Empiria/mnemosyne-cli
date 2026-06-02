@@ -54,6 +54,67 @@ def _replicate_assume_unchanged(main_root: Path, target: Path) -> None:
         )
 
 
+def setup_claude_overlay(
+    target: Path,
+    vault_path: Path,
+    vault_project_path: Path,
+) -> None:
+    """Wire the Empiria-only .claude/* overlay into target.
+
+    Creates:
+        target/.claude/settings.json       -> vault_project_path/claude-config/settings.json
+        target/.claude/rules/<file>        -> vault_path / <embed target>
+        target/.claude/rules/<file>        -> tech-stack auto-rules (per AGENTS.md)
+        target/.claude/skills/<skill>/     -> vault_path/agents/skills/<skill>/
+
+    Does NOT create .planning, AGENTS.md, or CLAUDE.md — those are universal
+    symlinks managed by setup_worktree_symlinks (unset branch) or by the
+    in-vault wire-codebase.py script (operational_home branch, D-C2).
+
+    All symlinks use force=True — existing files are replaced.
+
+    Raises: propagates exceptions from symlink creation. Callers wrap for
+    presentation.
+    """
+    claude_config = vault_project_path / "claude-config"
+    agents_target = vault_project_path / "AGENTS.md"
+
+    # .claude/settings.json
+    settings_target = claude_config / "settings.json"
+    if settings_target.exists():
+        lib_symlinks.create_symlink(
+            target / ".claude" / "settings.json", settings_target, force=True
+        )
+
+    # .claude/rules — per-file symlinks from embed notes
+    rules_embed_dir = claude_config / "rules"
+    if rules_embed_dir.is_dir():
+        for filename, target_rel in read_embed_targets(rules_embed_dir).items():
+            lib_symlinks.create_symlink(
+                target / ".claude" / "rules" / filename,
+                vault_path / target_rel,
+                force=True,
+            )
+
+    # .claude/rules — tech stack auto-rules
+    if agents_target.exists():
+        for tech in parse_tech_stack(agents_target):
+            for filename, target_abs in discover_tech_rules(vault_path, tech).items():
+                lib_symlinks.create_symlink(
+                    target / ".claude" / "rules" / filename,
+                    target_abs,
+                    force=True,
+                )
+
+    # .claude/skills — directory symlinks from skills.yaml
+    skills_yaml = claude_config / SKILLS_YAML_FILENAME
+    if skills_yaml.exists():
+        raw_names = parse_skills_list(skills_yaml)
+        skill_names = expand_skill_names(raw_names, vault_path)
+        for name in skill_names:
+            create_skill_symlink(target, name, vault_path)
+
+
 def setup_worktree_symlinks(
     target: Path,
     vault_path: Path,
@@ -100,38 +161,5 @@ def setup_worktree_symlinks(
     if source_checkout is not None:
         _replicate_assume_unchanged(source_checkout, target)
 
-    # .claude/settings.json
-    claude_config = vault_project_path / "claude-config"
-    settings_target = claude_config / "settings.json"
-    if settings_target.exists():
-        lib_symlinks.create_symlink(
-            target / ".claude" / "settings.json", settings_target, force=True
-        )
-
-    # .claude/rules — per-file symlinks from embed notes
-    rules_embed_dir = claude_config / "rules"
-    if rules_embed_dir.is_dir():
-        for filename, target_rel in read_embed_targets(rules_embed_dir).items():
-            lib_symlinks.create_symlink(
-                target / ".claude" / "rules" / filename,
-                vault_path / target_rel,
-                force=True,
-            )
-
-    # .claude/rules — tech stack auto-rules
-    if agents_target.exists():
-        for tech in parse_tech_stack(agents_target):
-            for filename, target_abs in discover_tech_rules(vault_path, tech).items():
-                lib_symlinks.create_symlink(
-                    target / ".claude" / "rules" / filename,
-                    target_abs,
-                    force=True,
-                )
-
-    # .claude/skills — directory symlinks from skills.yaml
-    skills_yaml = claude_config / SKILLS_YAML_FILENAME
-    if skills_yaml.exists():
-        raw_names = parse_skills_list(skills_yaml)
-        skill_names = expand_skill_names(raw_names, vault_path)
-        for name in skill_names:
-            create_skill_symlink(target, name, vault_path)
+    # Empiria-only .claude/* overlay
+    setup_claude_overlay(target, vault_path, vault_project_path)
