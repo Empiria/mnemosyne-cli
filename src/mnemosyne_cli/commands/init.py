@@ -281,8 +281,10 @@ def _run_host(project: str | None) -> None:
             raise typer.Exit(1)
 
         # Step 2: Compute the wire-codebase.py path and enforce containment (V5/V12)
+        # Resolve once so the same path is used for both the is_within guard and
+        # subprocess execution — eliminates the TOCTOU gap (WR-03).
         oh_root = vc.path.resolve()
-        wire = vc.path / oh.path / "wire-codebase.py"
+        wire = (vc.path / oh.path / "wire-codebase.py").resolve()
         if not lib_vault.is_within(oh_root, wire):
             error_console.print(
                 f"[red]Error[/red] operational_home.path '{oh.path}' escapes the OH vault "
