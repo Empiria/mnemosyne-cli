@@ -42,6 +42,32 @@ def add_git_exclusion(entry: str, git_dir: Path) -> None:
             f.write(f"{entry}\n")
 
 
+def check_gitignore_entry(entry: str, repo_root: Path) -> bool:
+    """Return True if *entry* is already listed in repo_root/.gitignore.
+
+    Returns False when .gitignore does not exist or entry is absent.
+    Mirrors check_git_exclusion but targets the tracked .gitignore (D-C5).
+    """
+    gitignore = repo_root / ".gitignore"
+    if not gitignore.exists():
+        return False
+    return entry in gitignore.read_text().splitlines()
+
+
+def add_gitignore_entry(entry: str, repo_root: Path) -> None:
+    """Add *entry* to repo_root/.gitignore idempotently.
+
+    Creates .gitignore if it does not exist. Appends entry only when absent.
+    Mirrors add_git_exclusion but targets the tracked .gitignore (D-C5).
+    """
+    gitignore = repo_root / ".gitignore"
+    gitignore.touch()
+    lines = gitignore.read_text().splitlines()
+    if entry not in lines:
+        with open(gitignore, "a") as f:
+            f.write(f"{entry}\n")
+
+
 def register_merge_drivers(vault_path: Path) -> None:
     """Register gsd-state and gsd-roadmap custom merge drivers in the vault repo."""
     drivers = [
