@@ -17,6 +17,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Known schema sets — the source of D-19 strict validation
@@ -78,8 +79,8 @@ class ShareManifest:
     mode: str
 
     # Mode-specific blocks — None when not present
-    direct: dict[str, object] | None
-    intermediary: dict[str, object] | None
+    direct: dict[str, Any] | None
+    intermediary: dict[str, Any] | None
 
     # Seed-set matching
     include_paths: list[str]
@@ -90,7 +91,7 @@ class ShareManifest:
     policy: str
 
     # Optional license block
-    license: dict[str, object] | None
+    license: dict[str, Any] | None
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ class ShareManifest:
 # ---------------------------------------------------------------------------
 
 
-def validate_manifest_dict(data: dict[str, object]) -> ShareManifest:
+def validate_manifest_dict(data: dict[str, Any]) -> ShareManifest:
     """Validate a raw dict (from ``tomllib.load``) against the manifest schema.
 
     Implements strict D-19 validation:
@@ -227,13 +228,13 @@ def validate_manifest_dict(data: dict[str, object]) -> ShareManifest:
         raise ManifestError(
             "share-manifest has mode='direct' but the required [direct] table is missing"
         )
-    direct: dict[str, object] | None = dict(direct_raw) if direct_raw is not None else None
+    direct: dict[str, Any] | None = dict(direct_raw) if direct_raw is not None else None
 
     # ------------------------------------------------------------------
     # 7. Optional tables
     # ------------------------------------------------------------------
     intermediary_raw = data.get("intermediary")
-    intermediary: dict[str, object] | None = dict(intermediary_raw) if intermediary_raw is not None else None
+    intermediary: dict[str, Any] | None = dict(intermediary_raw) if intermediary_raw is not None else None
 
     exclude_raw = data.get("exclude")
     exclude_paths: list[str] = []
@@ -241,7 +242,7 @@ def validate_manifest_dict(data: dict[str, object]) -> ShareManifest:
         exclude_paths = list(exclude_raw.get("paths") or [])
 
     license_raw = data.get("license")
-    license_block: dict[str, object] | None = dict(license_raw) if license_raw is not None else None
+    license_block: dict[str, Any] | None = dict(license_raw) if license_raw is not None else None
 
     return ShareManifest(
         client_slug=client_slug,
