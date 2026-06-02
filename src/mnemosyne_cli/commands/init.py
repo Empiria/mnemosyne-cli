@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import typer
@@ -16,7 +18,7 @@ from mnemosyne_cli.lib import overrides as lib_overrides
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.checks import run_container_checks
-from mnemosyne_cli.lib.setup import setup_worktree_symlinks
+from mnemosyne_cli.lib.setup import setup_claude_overlay, setup_worktree_symlinks
 from mnemosyne_cli.lib.skills import discover_vault_skills
 
 console = Console()
@@ -253,49 +255,144 @@ def _run_host(project: str | None) -> None:
 
     errors: list[str] = []
 
-    # --- Symlinks ---
-    console.rule("[bold cyan]Creating symlinks[/bold cyan]")
+    # --- Operational home branch (D-D2) ---
+    # Read the operational_home field from the empiria-side engagement record.
+    # If present-but-malformed, read_operational_home raises ValueError (Open Q2 lock).
     try:
-        setup_worktree_symlinks(cwd, vault_path, vault_project_path)
-        console.print("  [green]Wired[/green] .planning, AGENTS.md, CLAUDE.md, .claude/*")
-    except Exception as exc:
-        error_console.print(f"  [red]Error[/red] symlink setup: {exc}")
-        errors.append("symlinks")
+        oh = lib_vault.read_operational_home(vault_path, project)
+    except ValueError as exc:
+        error_console.print(
+            f"[red]Error[/red] operational_home in vault record is malformed: {exc}\n"
+            "Fix the frontmatter in the engagement record and re-run."
+        )
+        raise typer.Exit(1)
 
-    # CLAUDE.md upstream-tracked override (only matters when CLAUDE.md is
-    # tracked in the client's upstream repo — apply the sparse-checkout +
-    # assume-unchanged pattern so the local symlink doesn't show as a
-    # typechange and can't be staged accidentally). setup_worktree_symlinks
-    # has already created the symlink with force=True; this just hardens it.
-    if lib_overrides.is_tracked(cwd, "CLAUDE.md"):
-        try:
-            lib_overrides.apply_claude_md_override(cwd, git_dir)
-            console.print(
-                "  [green]Hardened[/green] CLAUDE.md override "
-                "(sparse-checkout + assume-unchanged for upstream-tracked CLAUDE.md)"
+    if oh is not None:
+        # --- D-D2: operational_home-set branch ---
+
+        # Step 1: Resolve the OH vault by name
+        vc = lib_vault.vault_by_name(oh.vault)
+        if vc is None:
+            error_console.print(
+                f"[red]Error[/red] operational_home.vault '{oh.vault}' is not registered "
+                f"in config.toml.\n"
+                f"Register it with: [bold]mnemosyne vault add {oh.vault} <path>[/bold]"
             )
-        except Exception as exc:
-            error_console.print(f"  [red]Error[/red] CLAUDE.md override: {exc}")
-            errors.append("CLAUDE.md override")
+            raise typer.Exit(1)
 
-    # --- Git exclusions ---
-    console.rule("[bold cyan]Configuring git exclusions[/bold cyan]")
-    all_to_exclude = [
-        ".planning",
-        "AGENTS.md",
-        "CLAUDE.md",
-        ".envrc",
-        ".claude/rules",
-        ".claude/skills",
-        ".claude/settings.json",
-    ]
-    for entry in all_to_exclude:
+        # Step 2: Compute the wire-codebase.py path and enforce containment (V5/V12)
+        oh_root = vc.path.resolve()
+        wire = vc.path / oh.path / "wire-codebase.py"
+        if not lib_vault.is_within(oh_root, wire):
+            error_console.print(
+                f"[red]Error[/red] operational_home.path '{oh.path}' escapes the OH vault "
+                f"root ({oh_root}). Path traversal rejected."
+            )
+            raise typer.Exit(1)
+
+        # Step 3: Verify the script exists
+        if not wire.is_file():
+            error_console.print(
+                f"[red]Error[/red] wire-codebase.py not found at expected path:\n"
+                f"  {wire}\n"
+                "Create the script in the operational-home vault project directory."
+            )
+            raise typer.Exit(1)
+
+        # Step 4: Run the in-vault wire-codebase.py to create .planning, AGENTS.md, CLAUDE.md
+        console.rule("[bold cyan]Wiring universal symlinks (operational-home vault)[/bold cyan]")
         try:
-            lib_git.add_git_exclusion(entry, git_dir)
-            console.print(f"  [green]Configured[/green] .git/info/exclude: {entry}")
+            result = subprocess.run(
+                [sys.executable, str(wire), str(cwd)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            console.print(
+                f"  [green]Wired[/green] .planning, AGENTS.md, CLAUDE.md "
+                f"(via {wire.name})"
+            )
+        except subprocess.CalledProcessError as exc:
+            error_console.print(
+                f"[red]Error[/red] wire-codebase.py failed (exit {exc.returncode}):\n"
+                f"{exc.stderr}"
+            )
+            raise typer.Exit(1)
+
+        # Step 5: Layer the Empiria-only .claude/* overlay against the empiria vault
+        console.rule("[bold cyan]Layering Empiria overlay[/bold cyan]")
+        try:
+            setup_claude_overlay(cwd, vault_path, vault_project_path)
+            console.print("  [green]Wired[/green] .claude/* (settings, rules, skills)")
         except Exception as exc:
-            error_console.print(f"  [red]Error[/red] git exclusion for {entry}: {exc}")
-            errors.append(f"git exclude: {entry}")
+            error_console.print(f"  [red]Error[/red] overlay setup: {exc}")
+            errors.append("overlay")
+
+        # Step 6: Split exclusions (D-C5)
+        # .planning and AGENTS.md → tracked .gitignore (public convention)
+        # .claude/* → .git/info/exclude (per-clone, never tracked)
+        console.rule("[bold cyan]Configuring git exclusions (D-C5 split)[/bold cyan]")
+        for entry in (".planning", "AGENTS.md"):
+            try:
+                lib_git.add_gitignore_entry(entry, cwd)
+                console.print(f"  [green]Configured[/green] .gitignore: {entry}")
+            except Exception as exc:
+                error_console.print(f"  [red]Error[/red] .gitignore entry for {entry}: {exc}")
+                errors.append(f"gitignore: {entry}")
+        for entry in (".claude/rules", ".claude/skills", ".claude/settings.json"):
+            try:
+                lib_git.add_git_exclusion(entry, git_dir)
+                console.print(f"  [green]Configured[/green] .git/info/exclude: {entry}")
+            except Exception as exc:
+                error_console.print(f"  [red]Error[/red] git exclusion for {entry}: {exc}")
+                errors.append(f"git exclude: {entry}")
+
+    else:
+        # --- D-D1: operational_home unset — today's path, byte-identical ---
+
+        # --- Symlinks ---
+        console.rule("[bold cyan]Creating symlinks[/bold cyan]")
+        try:
+            setup_worktree_symlinks(cwd, vault_path, vault_project_path)
+            console.print("  [green]Wired[/green] .planning, AGENTS.md, CLAUDE.md, .claude/*")
+        except Exception as exc:
+            error_console.print(f"  [red]Error[/red] symlink setup: {exc}")
+            errors.append("symlinks")
+
+        # CLAUDE.md upstream-tracked override (only matters when CLAUDE.md is
+        # tracked in the client's upstream repo — apply the sparse-checkout +
+        # assume-unchanged pattern so the local symlink doesn't show as a
+        # typechange and can't be staged accidentally). setup_worktree_symlinks
+        # has already created the symlink with force=True; this just hardens it.
+        if lib_overrides.is_tracked(cwd, "CLAUDE.md"):
+            try:
+                lib_overrides.apply_claude_md_override(cwd, git_dir)
+                console.print(
+                    "  [green]Hardened[/green] CLAUDE.md override "
+                    "(sparse-checkout + assume-unchanged for upstream-tracked CLAUDE.md)"
+                )
+            except Exception as exc:
+                error_console.print(f"  [red]Error[/red] CLAUDE.md override: {exc}")
+                errors.append("CLAUDE.md override")
+
+        # --- Git exclusions ---
+        console.rule("[bold cyan]Configuring git exclusions[/bold cyan]")
+        all_to_exclude = [
+            ".planning",
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".envrc",
+            ".claude/rules",
+            ".claude/skills",
+            ".claude/settings.json",
+        ]
+        for entry in all_to_exclude:
+            try:
+                lib_git.add_git_exclusion(entry, git_dir)
+                console.print(f"  [green]Configured[/green] .git/info/exclude: {entry}")
+            except Exception as exc:
+                error_console.print(f"  [red]Error[/red] git exclusion for {entry}: {exc}")
+                errors.append(f"git exclude: {entry}")
 
     # --- .envrc ---
     console.rule("[bold cyan]Setting up environment[/bold cyan]")
@@ -342,7 +439,8 @@ def _run_host(project: str | None) -> None:
     table.add_column()
     table.add_row("Vault", str(vault_path))
     table.add_row("Project", project)
-    table.add_row("Git exclusions", f"{len(all_to_exclude)} entries added")
+    if oh is not None:
+        table.add_row("Mode", f"operational-home ({oh.vault})")
     if errors:
         table.add_row("[red]Errors[/red]", f"{len(errors)} step(s) failed")
     console.print(Panel(table, title="[bold]Setup Summary[/bold]", border_style="cyan"))

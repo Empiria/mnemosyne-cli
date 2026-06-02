@@ -25,12 +25,17 @@ import textwrap
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 import typer
 
 from mnemosyne_cli.commands import init
 from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import vault as lib_vault
+
+# typer.Exit raises click.exceptions.Exit (RuntimeError subclass, not SystemExit).
+# Both are possible depending on how typer/click dispatch the exit.
+_EXIT_EXCEPTIONS = (SystemExit, click.exceptions.Exit)
 
 # ---------------------------------------------------------------------------
 # Location of the canonical wire-codebase-template.py
@@ -275,10 +280,11 @@ def test_init_oh_unregistered_vault_fails(
         patch("mnemosyne_cli.commands.init.Path.cwd", return_value=app),
         patch("mnemosyne_cli.commands.init.error_console.print", side_effect=_capturing_print),
     ):
-        with pytest.raises(SystemExit) as exc_info:
+        with pytest.raises(_EXIT_EXCEPTIONS) as exc_info:
             init.run(project="projects/friendly-fox/infinite-worlds")
 
-    assert exc_info.value.code != 0, "Expected non-zero exit"
+    exit_code = exc_info.value.code if hasattr(exc_info.value, "code") else None
+    assert exit_code != 0, f"Expected non-zero exit, got code={exit_code!r}"
     all_messages = " ".join(captured_messages)
     assert "mnemosyne vault add" in all_messages, (
         f"Expected 'mnemosyne vault add' in error output. Got: {all_messages!r}"
@@ -311,10 +317,11 @@ def test_init_oh_missing_wire_script_fails(
         patch("mnemosyne_cli.commands.init.Path.cwd", return_value=app),
         patch("mnemosyne_cli.commands.init.error_console.print", side_effect=_capturing_print),
     ):
-        with pytest.raises(SystemExit) as exc_info:
+        with pytest.raises(_EXIT_EXCEPTIONS) as exc_info:
             init.run(project="projects/friendly-fox/infinite-worlds")
 
-    assert exc_info.value.code != 0, "Expected non-zero exit"
+    exit_code = exc_info.value.code if hasattr(exc_info.value, "code") else None
+    assert exit_code != 0, f"Expected non-zero exit, got code={exit_code!r}"
     all_messages = " ".join(captured_messages)
     assert "wire-codebase.py" in all_messages, (
         f"Expected 'wire-codebase.py' to be named in error output. Got: {all_messages!r}"
@@ -370,10 +377,11 @@ def test_init_oh_path_traversal_rejected(
         patch("mnemosyne_cli.commands.init.error_console.print", side_effect=_capturing_print),
         patch("subprocess.run", side_effect=_spy_subprocess_run),
     ):
-        with pytest.raises(SystemExit) as exc_info:
+        with pytest.raises(_EXIT_EXCEPTIONS) as exc_info:
             init.run(project="projects/friendly-fox/infinite-worlds")
 
-    assert exc_info.value.code != 0, "Expected non-zero exit on path-traversal"
+    exit_code = exc_info.value.code if hasattr(exc_info.value, "code") else None
+    assert exit_code != 0, f"Expected non-zero exit on path-traversal, got code={exit_code!r}"
     # The subprocess must NOT have been called with the wire-codebase script
     wire_calls = [
         c for c in subprocess_calls
