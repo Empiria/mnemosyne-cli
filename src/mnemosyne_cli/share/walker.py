@@ -116,11 +116,39 @@ class WalkResult:
 # ---------------------------------------------------------------------------
 
 
+def _vault_md_files(vault_root: Path) -> Iterator[Path]:
+    """Yield all ``.md`` files under *vault_root*, skipping hidden directories.
+
+    Hidden directories (any path component starting with ``.``) are skipped so
+    that git worktrees (``.claude/worktrees/``), SCION agent workspaces
+    (``.scion/agents/``), and other dot-prefixed tooling directories are never
+    included in the vault index or seed scan.  Duplicate copies of vault notes
+    in worktrees would otherwise cause spurious :class:`AmbiguousLinkError`
+    exceptions when a bare ``[[name]]`` resolves to multiple candidates.
+
+    Args:
+        vault_root: Absolute path to the vault root directory.
+
+    Yields:
+        Absolute :class:`~pathlib.Path` objects for each non-hidden ``.md``
+        file beneath *vault_root*.
+    """
+    for md_file in vault_root.rglob("*.md"):
+        rel_parts = md_file.relative_to(vault_root).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        yield md_file
+
+
 def _index_vault(vault_root: Path) -> dict[str, list[str]]:
     """Build a basename → [vault-rel paths] index for all .md files.
 
     Used to resolve bare ``[[name]]`` links (D-01): one match → resolved;
     zero matches → broken; two or more → :class:`AmbiguousLinkError`.
+
+    Hidden directories are excluded via :func:`_vault_md_files` so that
+    git worktrees and SCION agent workspace copies of vault notes do not
+    cause spurious ambiguity errors.
 
     Args:
         vault_root: Absolute path to the vault root directory.
@@ -130,7 +158,7 @@ def _index_vault(vault_root: Path) -> dict[str, list[str]]:
         relative POSIX path strings.  Keys are case-sensitive.
     """
     index: dict[str, list[str]] = {}
-    for md_file in vault_root.rglob("*.md"):
+    for md_file in _vault_md_files(vault_root):
         rel = md_file.relative_to(vault_root).as_posix()
         stem = md_file.stem  # basename without .md
         index.setdefault(stem, []).append(rel)
@@ -229,10 +257,10 @@ def resolve_seed(manifest: ShareManifest, vault_root: Path) -> set[str]:
 
     include_tag_set: set[str] = set(manifest.include_tags)
 
-    # Collect all vault .md files
+    # Collect all vault .md files (hidden directories excluded via _vault_md_files)
     all_md: list[str] = [
         p.relative_to(vault_root).as_posix()
-        for p in vault_root.rglob("*.md")
+        for p in _vault_md_files(vault_root)
     ]
 
     seed: set[str] = set()
