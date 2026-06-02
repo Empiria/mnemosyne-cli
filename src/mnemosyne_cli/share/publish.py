@@ -418,7 +418,7 @@ def build_published_json(
     return {
         "schema_version": "1.0",
         "publish_timestamp": datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
+            "%Y-%m-%dT%H:%M:%S.%fZ"
         ),
         "source_vault_sha": source_vault_sha,
         "share_manifest_hash": share_manifest_hash,
@@ -801,13 +801,16 @@ def get_short_sha(repo_path: Path) -> str:
     return result.stdout.strip()
 
 
-def git_commit(repo_path: Path, paths: list[str], message: str) -> None:
+def git_commit(repo_path: Path, paths: list[str], message: str) -> bool:
     """Stage *paths* and create a git commit in *repo_path*.
 
     Args:
         repo_path: Working directory for the commit (the target vault root).
         paths:     List of relative paths to stage (``git add``).
         message:   Commit message.
+
+    Returns:
+        True if a commit was created, False if nothing changed to commit.
     """
     subprocess.run(
         ["git", "add", "--"] + paths,
@@ -816,13 +819,21 @@ def git_commit(repo_path: Path, paths: list[str], message: str) -> None:
         capture_output=True,
         text=True,
     )
-    subprocess.run(
+    result = subprocess.run(
         ["git", "commit", "-m", message],
         cwd=repo_path,
-        check=True,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        # "nothing to commit" is not an error for our purposes
+        if "nothing to commit" in result.stdout or "nothing to commit" in result.stderr:
+            return False
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=result.stdout, stderr=result.stderr,
+        )
+    return True
 
 
 def git_push_with_deploy_key(repo_path: Path, key_path: Path) -> None:
@@ -1022,7 +1033,7 @@ def run_publish(
     # Step 5: Load PUBLISHED.json + detect client edits (D-04)
     # -----------------------------------------------------------------------
     prior = load_published_json(publish_root)
-    detect_client_edits(publish_root, prior, force=force)
+    client_edits = detect_client_edits(publish_root, prior, force=force)
 
     # -----------------------------------------------------------------------
     # Step 6: Walk manifest + apply policy (Phase 48 walker)
@@ -1061,14 +1072,20 @@ def run_publish(
 
     # -----------------------------------------------------------------------
     # Step 8: NO-OP GATE (D-06) — must precede all writes
+    # When force=True and client edits exist, bypass gate (D-04 overwrite needed)
     # -----------------------------------------------------------------------
-    if not plan.has_changes and prior is not None:
+    if not plan.has_changes and prior is not None and not (force and client_edits):
         console.print("nothing to publish")
         return PublishResult(
             success=True,
             published=False,
             message="nothing to publish",
         )
+
+    # When force=True with client edits, we need to re-write all edited files
+    if force and client_edits and not plan.has_changes:
+        # Treat all in-set files as needing re-write to overwrite client edits
+        plan = compute_write_plan(current_sources, None)
 
     # -----------------------------------------------------------------------
     # Step 9: Stage notes + render LICENSE + THIRD-PARTY + PUBLISHED.json
@@ -1223,12 +1240,20 @@ def run_publish(
     )
 
     # Stage and commit: target_subtree + PUBLISHED.json
-    git_commit(
+    committed = git_commit(
         target_vault_path,
         [target_subtree],
         commit_message,
     )
-    git_push_with_deploy_key(target_vault_path, key_path)
+    if committed:
+        git_push_with_deploy_key(target_vault_path, key_path)
+    else:
+        # Nothing actually changed on disk — treat as no-op
+        return PublishResult(
+            success=True,
+            published=False,
+            message="nothing to publish",
+        )
 
     return PublishResult(
         success=True,

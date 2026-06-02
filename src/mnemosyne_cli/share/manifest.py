@@ -40,7 +40,7 @@ _KNOWN_KEYS: dict[str, set[str]] = {
     "include": {"paths", "tags"},
     "exclude": {"paths"},
     "on_closure_breach": {"policy"},
-    "license": {"template", "contract_ref", "copyright_holder", "spdx_license_ref"},
+    "license": {"template", "contract_ref", "copyright_holder", "spdx_license_ref", "license_template_reviewed_at", "reviewed_by"},
 }
 
 _VALID_MODES: set[str] = {"direct", "intermediary"}
