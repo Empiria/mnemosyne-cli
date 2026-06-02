@@ -202,6 +202,17 @@ def _build_checks(
     vault_project = lib_vault.resolve_vault_project(cwd, vault_path) if not is_vault else None
     vault_project_path = vault_path / vault_project if vault_project else None
 
+    # --- Read operational_home once (used by OH checks below) ---
+    # read_operational_home returns None when absent; raises ValueError when malformed.
+    # We surface malformed frontmatter as a FAILing check rather than letting
+    # _build_checks raise (Plan Action: handle ValueError inline).
+    _oh_error: str | None = None
+    try:
+        _oh = lib_vault.read_operational_home(vault_path, vault_project) if vault_project else None
+    except ValueError as exc:
+        _oh = None
+        _oh_error = str(exc)
+
     # --- Client-codebase-only checks (skipped when running from the vault) ---
 
     if not is_vault:
@@ -269,6 +280,138 @@ def _build_checks(
                     fix_description=f"Create AGENTS.md -> {agents_target}",
                 )
             )
+
+            # --- Category: Operational Home — symlink resolution + .gitignore ---
+            # D-E2: when operational_home is set, .planning and AGENTS.md must
+            # resolve *into* the OH vault (not some other vault).
+            # These checks run inside `if not is_vault:` and `if vault_project_path
+            # is not None:` per Pitfall 5 guard placement.
+
+            if _oh is not None:
+                # D-E3: skip symlink-resolution checks when no vaults registered
+                _oh_vc = lib_vault.vault_by_name(_oh.vault) if lib_vault.read_vaults_config() else None
+                if _oh_vc is not None:
+                    _oh_vault_root = _oh_vc.path
+
+                    def _check_planning_resolves_into_oh(
+                        _root: Path = _oh_vault_root,
+                        _link: Path = cwd / ".planning",
+                    ) -> CheckResult:
+                        """D-E2: .planning symlink must resolve inside OH vault."""
+                        if not _link.exists() and not _link.is_symlink():
+                            return CheckResult(
+                                ok=False,
+                                message=".planning symlink missing — cannot verify OH resolution",
+                                fix_cmd="mnemosyne init projects/<org>/<project>",
+                            )
+                        if not _link.is_symlink():
+                            return CheckResult(
+                                ok=False,
+                                message=".planning exists but is not a symlink",
+                                fix_cmd=None,
+                            )
+                        target = _link.resolve()
+                        if lib_vault.is_within(_root, target):
+                            return CheckResult(
+                                ok=True,
+                                message=f".planning resolves inside OH vault ({_root.name})",
+                            )
+                        return CheckResult(
+                            ok=False,
+                            message=(
+                                f".planning resolves to {target}, which is outside "
+                                f"operational_home vault {_root}"
+                            ),
+                            fix_cmd="mnemosyne init projects/<org>/<project>",
+                        )
+
+                    def _check_agents_md_resolves_into_oh(
+                        _root: Path = _oh_vault_root,
+                        _link: Path = cwd / "AGENTS.md",
+                    ) -> CheckResult:
+                        """D-E2: AGENTS.md symlink must resolve inside OH vault."""
+                        if not _link.exists() and not _link.is_symlink():
+                            return CheckResult(
+                                ok=False,
+                                message="AGENTS.md symlink missing — cannot verify OH resolution",
+                                fix_cmd="mnemosyne init projects/<org>/<project>",
+                            )
+                        if not _link.is_symlink():
+                            return CheckResult(
+                                ok=False,
+                                message="AGENTS.md exists but is not a symlink",
+                                fix_cmd=None,
+                            )
+                        target = _link.resolve()
+                        if lib_vault.is_within(_root, target):
+                            return CheckResult(
+                                ok=True,
+                                message=f"AGENTS.md resolves inside OH vault ({_root.name})",
+                            )
+                        return CheckResult(
+                            ok=False,
+                            message=(
+                                f"AGENTS.md resolves to {target}, which is outside "
+                                f"operational_home vault {_root}"
+                            ),
+                            fix_cmd="mnemosyne init projects/<org>/<project>",
+                        )
+
+                    checks.append(
+                        Check(
+                            name=".planning resolves into OH vault",
+                            category="Operational Home",
+                            _check_fn=_check_planning_resolves_into_oh,
+                        )
+                    )
+                    checks.append(
+                        Check(
+                            name="AGENTS.md resolves into OH vault",
+                            category="Operational Home",
+                            _check_fn=_check_agents_md_resolves_into_oh,
+                        )
+                    )
+
+            # D-E2: .planning and AGENTS.md must be listed in tracked .gitignore
+            # (D-C5: universal symlinks go to .gitignore, not .git/info/exclude)
+            # D-E3: skip when no vaults registered (empiria-absent machine).
+            if _oh is not None:
+                def _check_planning_in_gitignore(_cwd: Path = cwd) -> CheckResult:
+                    if not lib_vault.read_vaults_config():
+                        return CheckResult(ok=True, message="no vaults registered — skipped")
+                    if lib_git.check_gitignore_entry(".planning", _cwd):
+                        return CheckResult(ok=True, message=".planning in .gitignore")
+                    return CheckResult(
+                        ok=False,
+                        message=".planning not listed in .gitignore (D-C5 requires tracked gitignore)",
+                        fix_cmd='echo ".planning" >> .gitignore',
+                    )
+
+                def _check_agents_md_in_gitignore(_cwd: Path = cwd) -> CheckResult:
+                    if not lib_vault.read_vaults_config():
+                        return CheckResult(ok=True, message="no vaults registered — skipped")
+                    if lib_git.check_gitignore_entry("AGENTS.md", _cwd):
+                        return CheckResult(ok=True, message="AGENTS.md in .gitignore")
+                    return CheckResult(
+                        ok=False,
+                        message="AGENTS.md not listed in .gitignore (D-C5 requires tracked gitignore)",
+                        fix_cmd='echo "AGENTS.md" >> .gitignore',
+                    )
+
+                checks.append(
+                    Check(
+                        name=".planning listed in .gitignore",
+                        category="Operational Home",
+                        _check_fn=_check_planning_in_gitignore,
+                    )
+                )
+                checks.append(
+                    Check(
+                        name="AGENTS.md listed in .gitignore",
+                        category="Operational Home",
+                        _check_fn=_check_agents_md_in_gitignore,
+                    )
+                )
 
             # CLAUDE.md (local symlink) — only when upstream doesn't track
             # CLAUDE.md. When it does, the Local Overrides category covers
@@ -1304,6 +1447,193 @@ def _build_checks(
                 _check_fn=_check_user_profile_env_no_overrides,
             )
         )
+
+    # --- Category: Operational Home (D-E1/E2/E3) ---
+    # Config-global checks (vault registration, path existence, script presence)
+    # run ALWAYS — no cwd dependency (like Merge Drivers, Vault Consistency).
+    # These are distinct from the symlink-resolution checks (inside is_vault guard
+    # above) that need a valid cwd + .planning symlink.
+
+    if _oh_error is not None:
+        # Malformed operational_home frontmatter — surface as a FAILing check
+        _error_msg = _oh_error
+
+        def _check_oh_malformed(_msg: str = _error_msg) -> CheckResult:
+            return CheckResult(ok=False, message=f"operational_home malformed: {_msg}")
+
+        checks.append(
+            Check(
+                name="operational_home frontmatter valid",
+                category="Operational Home",
+                _check_fn=_check_oh_malformed,
+            )
+        )
+    elif _oh is None:
+        # No operational_home set — skip gracefully (D-E3, empiria-resident project)
+        def _check_oh_absent() -> CheckResult:
+            return CheckResult(ok=True, message="no operational_home (empiria-resident)")
+
+        checks.append(
+            Check(
+                name="operational_home vault registered",
+                category="Operational Home",
+                _check_fn=_check_oh_absent,
+            )
+        )
+    else:
+        # operational_home is set — run D-E1/E2 config-global checks
+
+        def _check_oh_vault_registered(_oh_local=_oh) -> CheckResult:
+            """D-E1: operational_home.vault must be registered in config.toml.
+
+            D-E3: when no vaults are registered at all (empiria-absent machine),
+            skip gracefully rather than fail — mirrors broker/onboarding precedents.
+            """
+            registered = lib_vault.read_vaults_config()
+            if not registered:
+                return CheckResult(
+                    ok=True,
+                    message=(
+                        f"no vaults registered — operational_home checks skipped "
+                        f"(run `mnemosyne vault add` to register)"
+                    ),
+                )
+            vc = lib_vault.vault_by_name(_oh_local.vault)
+            if vc is None:
+                return CheckResult(
+                    ok=False,
+                    message=(
+                        f"operational_home.vault '{_oh_local.vault}' not registered "
+                        "in config.toml"
+                    ),
+                    fix_cmd=f"mnemosyne vault add {_oh_local.vault} <path>",
+                )
+            return CheckResult(
+                ok=True,
+                message=f"operational_home.vault '{_oh_local.vault}' registered",
+            )
+
+        def _check_oh_path_resolves(_oh_local=_oh) -> CheckResult:
+            """D-E2: operational_home.path must resolve to an existing dir inside OH vault.
+
+            D-E3: skip gracefully when no vaults are registered.
+            """
+            if not lib_vault.read_vaults_config():
+                return CheckResult(ok=True, message="no vaults registered — skipped")
+            vc = lib_vault.vault_by_name(_oh_local.vault)
+            if vc is None:
+                # Already caught by vault-registered check — skip gracefully
+                return CheckResult(
+                    ok=True,
+                    message=f"OH vault '{_oh_local.vault}' unregistered — skipped",
+                )
+            oh_path = vc.path / _oh_local.path
+            if not lib_vault.is_within(vc.path, oh_path):
+                return CheckResult(
+                    ok=False,
+                    message=(
+                        f"operational_home.path '{_oh_local.path}' escapes OH vault root "
+                        f"(path-traversal rejected)"
+                    ),
+                    fix_cmd=None,
+                )
+            if not oh_path.is_dir():
+                return CheckResult(
+                    ok=False,
+                    message=(
+                        f"operational_home.path '{_oh_local.path}' does not resolve to "
+                        f"an existing directory in vault '{_oh_local.vault}' "
+                        f"(expected: {oh_path})"
+                    ),
+                    fix_cmd=None,
+                )
+            return CheckResult(
+                ok=True,
+                message=f"operational_home.path '{_oh_local.path}' exists in '{_oh_local.vault}'",
+            )
+
+        def _check_oh_wire_script(_oh_local=_oh) -> CheckResult:
+            """D-E2: wire-codebase.py must exist at {oh_vault}/{oh.path}/wire-codebase.py.
+
+            D-E3: skip gracefully when no vaults are registered.
+            """
+            if not lib_vault.read_vaults_config():
+                return CheckResult(ok=True, message="no vaults registered — skipped")
+            vc = lib_vault.vault_by_name(_oh_local.vault)
+            if vc is None:
+                return CheckResult(
+                    ok=True,
+                    message=f"OH vault '{_oh_local.vault}' unregistered — skipped",
+                )
+            wire = vc.path / _oh_local.path / "wire-codebase.py"
+            if not lib_vault.is_within(vc.path, wire):
+                return CheckResult(
+                    ok=False,
+                    message=f"wire-codebase.py path escapes OH vault root (path-traversal rejected)",
+                    fix_cmd=None,
+                )
+            if not wire.is_file():
+                return CheckResult(
+                    ok=False,
+                    message=(
+                        f"wire-codebase.py missing at {wire} — "
+                        f"create it in the operational-home vault "
+                        f"(see docs/reference/wire-codebase-template.md)"
+                    ),
+                    fix_cmd=None,
+                )
+            return CheckResult(ok=True, message=f"wire-codebase.py present at {wire}")
+
+        checks.append(
+            Check(
+                name="operational_home vault registered",
+                category="Operational Home",
+                _check_fn=_check_oh_vault_registered,
+            )
+        )
+        checks.append(
+            Check(
+                name="operational_home path resolves",
+                category="Operational Home",
+                _check_fn=_check_oh_path_resolves,
+            )
+        )
+        checks.append(
+            Check(
+                name="wire-codebase.py exists",
+                category="Operational Home",
+                _check_fn=_check_oh_wire_script,
+            )
+        )
+
+    # --- Category: Vault Consistency (D-F1) ---
+    # Cross-check [[vault_rules]] against [vaults.*]. Config-global; runs ALWAYS.
+
+    def _check_vault_rules_consistency() -> CheckResult:
+        """D-F1: orphan vault_rules entries and unregistered can_read refs → FAIL."""
+        problems = lib_vault.validate_vault_rules()
+        if not problems:
+            registered = lib_vault.read_vaults_config()
+            if not registered:
+                return CheckResult(
+                    ok=True,
+                    message="no vaults registered — vault_rules consistency skipped",
+                )
+            return CheckResult(ok=True, message="vault_rules consistent")
+        joined = "; ".join(problems)
+        return CheckResult(
+            ok=False,
+            message=f"vault_rules inconsistencies: {joined}",
+            fix_cmd="Edit ~/.config/mnemosyne/config.toml — remove orphan/unregistered entries",
+        )
+
+    checks.append(
+        Check(
+            name="vault_rules consistent",
+            category="Vault Consistency",
+            _check_fn=_check_vault_rules_consistency,
+        )
+    )
 
     return checks
 
