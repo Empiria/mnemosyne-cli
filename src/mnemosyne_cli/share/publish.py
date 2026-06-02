@@ -1,7 +1,8 @@
-"""Content producers for mnemosyne tech-publish (Phase 49 Plan 01).
+"""Content producers for mnemosyne tech-publish (Phase 49 Plans 01 and 02).
 
 Pure, side-effect-light building blocks:
 
+Plan 01 — content producers:
 - ``PublishError``               — domain error for publish failures
 - ``content_hash``               — SHA-256 hash of a file (``sha256:<hex>``)
 - ``stage_note``                 — copy a source note to dest with SPDX injection
@@ -9,6 +10,14 @@ Pure, side-effect-light building blocks:
 - ``extract_third_party``        — collect spdx:/attribution: notes from in-set
 - ``render_license``             — substitute placeholders in a licence template
 - ``render_third_party_notices`` — build THIRD-PARTY-NOTICES.md from third-party list
+
+Plan 02 — idempotency + provenance layer:
+- ``WritePlan``                  — frozen dataclass: to_write, to_delete, has_changes
+- ``load_published_json``        — read PUBLISHED.json from publish root (or None)
+- ``build_published_json``       — assemble the eight-field D-08 provenance dict
+- ``write_published_json``       — write PUBLISHED.json with sort_keys + newline
+- ``compute_write_plan``         — diff current source hashes against prior PUBLISHED.json
+- ``detect_client_edits``        — compare target files against prior output hashes (D-04)
 
 These functions are deliberately PURE w.r.t. config and git:
   - No config.toml / secrets.toml reads
@@ -21,13 +30,18 @@ Determinism (D-09):
     in the output frontmatter are alphabetically sorted, giving byte-identical
     dumps for the same input.
   - third-party lists are sorted by path before any rendering.
-  - No wall-clock calls (datetime.now, time.time, etc.).
+  - PUBLISHED.json uses sort_keys=True for stable key ordering.
+  - PUBLISHED.json is explicitly excluded from the determinism scope — it carries
+    a wall-clock timestamp (D-09 exemption).
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import frontmatter
@@ -300,3 +314,258 @@ def render_third_party_notices(third_party: list[dict]) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Phase 49 Plan 02 — idempotency + provenance layer (D-04/D-05/D-06/D-07/D-08)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# WritePlan
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WritePlan:
+    """The result of :func:`compute_write_plan`.
+
+    Attributes:
+        to_write:  Sorted list of output-relative paths whose source-side hash
+                   is new or has changed since the prior publish (D-05).
+        to_delete: Sorted list of output-relative paths that were in the prior
+                   ``PUBLISHED.json`` but are no longer in the current output
+                   set (D-05 deletions).
+    """
+
+    to_write: list[str]
+    to_delete: list[str]
+
+    @property
+    def has_changes(self) -> bool:
+        """``True`` if any writes or deletions are needed (D-06)."""
+        return bool(self.to_write or self.to_delete)
+
+
+# ---------------------------------------------------------------------------
+# load_published_json
+# ---------------------------------------------------------------------------
+
+
+def load_published_json(publish_root: Path) -> dict | None:
+    """Read ``PUBLISHED.json`` from *publish_root*.
+
+    Args:
+        publish_root: The publish root directory (e.g. ``imported/empiria/``).
+
+    Returns:
+        The parsed JSON dict, or ``None`` if the file does not exist (first
+        publish).
+
+    Raises:
+        ``PublishError`` if the file exists but cannot be parsed as valid JSON.
+    """
+    path = publish_root / "PUBLISHED.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PublishError(
+            f"load_published_json: PUBLISHED.json at {path} is not valid JSON: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# build_published_json
+# ---------------------------------------------------------------------------
+
+
+def build_published_json(
+    *,
+    source_vault_sha: str,
+    share_manifest_hash: str,
+    license_md_hash: str,
+    third_party_notices_hash: str,
+    file_hashes: dict[str, dict],
+) -> dict:
+    """Assemble a ``PUBLISHED.json`` provenance dict (D-08).
+
+    The dict carries the eight required D-08 fields:
+    - ``schema_version``              — always ``"1.0"``
+    - ``publish_timestamp``           — UTC ISO-8601 string ending in ``Z``
+      (tz-aware ``datetime.now(timezone.utc)``; no deprecated wall-clock helpers)
+    - ``source_vault_sha``            — short git SHA of the source vault HEAD
+    - ``share_manifest_hash``         — ``sha256:…`` of the share-manifest
+    - ``license_md_hash``             — ``sha256:…`` of rendered LICENSE.md
+    - ``third_party_notices_hash``    — ``sha256:…`` of THIRD-PARTY-NOTICES.md
+    - ``files``                       — per-file entries with both hashes (D-07)
+
+    Args:
+        source_vault_sha:          Short git SHA of the source vault HEAD.
+        share_manifest_hash:       Content hash of the share-manifest file.
+        license_md_hash:           Content hash of the rendered LICENSE.md.
+        third_party_notices_hash:  Content hash of THIRD-PARTY-NOTICES.md.
+        file_hashes:               Dict mapping output-relative path to
+                                   ``{"source_hash": ..., "output_hash": ...}``.
+
+    Returns:
+        The provenance dict ready for :func:`write_published_json`.
+    """
+    return {
+        "schema_version": "1.0",
+        "publish_timestamp": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "source_vault_sha": source_vault_sha,
+        "share_manifest_hash": share_manifest_hash,
+        "license_md_hash": license_md_hash,
+        "third_party_notices_hash": third_party_notices_hash,
+        "files": file_hashes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# write_published_json
+# ---------------------------------------------------------------------------
+
+
+def write_published_json(publish_root: Path, data: dict) -> None:
+    """Serialise *data* to ``PUBLISHED.json`` at *publish_root*.
+
+    Uses ``sort_keys=True, indent=2`` for human-readable, stable key ordering
+    and appends a trailing newline.  Note: ``sort_keys`` keeps the file
+    readable and diff-friendly — the legitimately-varying fields
+    (``publish_timestamp``, ``source_vault_sha``) sit near the bottom of the
+    alphabetical sort, making them easy to spot in diffs (D-09 exemption).
+
+    Args:
+        publish_root: Directory where ``PUBLISHED.json`` will be written.
+        data:         Provenance dict as returned by :func:`build_published_json`.
+    """
+    path = publish_root / "PUBLISHED.json"
+    path.write_text(
+        json.dumps(data, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------------
+# compute_write_plan
+# ---------------------------------------------------------------------------
+
+
+def compute_write_plan(
+    current_sources: dict[str, str],
+    prior_published: dict | None,
+) -> WritePlan:
+    """Compute which output files need to be written or deleted (D-05).
+
+    Compares *current_sources* (output-relative-path → current source-side
+    ``content_hash``) against the hashes recorded in *prior_published* and
+    returns a :class:`WritePlan`.
+
+    Rules:
+    - If *prior_published* is ``None`` (first publish): every current path is
+      ``to_write``; nothing to delete.
+    - Otherwise, a path is ``to_write`` if it is new OR if its current source
+      hash differs from ``prior_published["files"][path]["source_hash"]``.
+    - A path is ``to_delete`` if it appears in ``prior_published["files"]``
+      but NOT in *current_sources* (file removed from the output set).
+    - Both ``to_write`` and ``to_delete`` are sorted for determinism (D-09).
+
+    Args:
+        current_sources:  Maps output-relative path → current ``content_hash``.
+        prior_published:  The loaded ``PUBLISHED.json`` dict, or ``None``.
+
+    Returns:
+        A :class:`WritePlan` with sorted ``to_write`` and ``to_delete`` lists.
+    """
+    if prior_published is None:
+        return WritePlan(
+            to_write=sorted(current_sources.keys()),
+            to_delete=[],
+        )
+
+    prior_files: dict[str, dict] = prior_published.get("files", {})
+
+    to_write: list[str] = []
+    for rel, current_hash in current_sources.items():
+        prior_entry = prior_files.get(rel)
+        if prior_entry is None or prior_entry.get("source_hash") != current_hash:
+            to_write.append(rel)
+
+    to_delete: list[str] = [
+        rel for rel in prior_files if rel not in current_sources
+    ]
+
+    return WritePlan(
+        to_write=sorted(to_write),
+        to_delete=sorted(to_delete),
+    )
+
+
+# ---------------------------------------------------------------------------
+# detect_client_edits
+# ---------------------------------------------------------------------------
+
+
+def detect_client_edits(
+    publish_root: Path,
+    prior_published: dict | None,
+    *,
+    force: bool,
+) -> list[str]:
+    """Detect files in the publish subtree that a client has edited or deleted (D-04).
+
+    Compares the current on-disk content of each file recorded in
+    *prior_published*[``"files"``] against the stored ``output_hash`` (the
+    hash of the file as Empiria last wrote it).  A mismatch means the client
+    modified or deleted the file.
+
+    NOTE: Only the entries in ``"files"`` are checked.  Sibling files such as
+    ``LICENSE.md`` and ``THIRD-PARTY-NOTICES.md`` are Empiria-generated
+    artefacts and are not client-edit-protected (49-RESEARCH Open Q3).
+
+    Args:
+        publish_root:     The publish root directory.
+        prior_published:  The loaded ``PUBLISHED.json`` dict, or ``None`` for a
+                          first publish (returns ``[]`` immediately — nothing to
+                          protect yet).
+        force:            If ``True``, return the edited list without raising
+                          (caller takes responsibility).  If ``False`` and the
+                          list is non-empty, raise ``PublishError``.
+
+    Returns:
+        A list of strings describing edited/deleted files.  Deleted entries are
+        reported as ``"<rel> (deleted)"``.  Returns ``[]`` when nothing has
+        changed (or *prior_published* is ``None``).
+
+    Raises:
+        ``PublishError`` if client edits are detected and *force* is ``False``.
+    """
+    if prior_published is None:
+        return []
+
+    prior_files: dict[str, dict] = prior_published.get("files", {})
+    edited: list[str] = []
+
+    for rel, info in prior_files.items():
+        target = publish_root / rel
+        expected_hash = info.get("output_hash", "")
+
+        if not target.exists():
+            edited.append(f"{rel} (deleted)")
+        elif content_hash(target) != expected_hash:
+            edited.append(rel)
+
+    if edited and not force:
+        paths_listed = "\n  ".join(edited)
+        raise PublishError(
+            f"detect_client_edits: the following files in the publish subtree "
+            f"have been modified or deleted since the last publish:\n"
+            f"  {paths_listed}\n"
+            f"Re-run with --force to overwrite, or restore the files first."
+        )
+
+    return edited

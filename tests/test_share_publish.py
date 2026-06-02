@@ -452,40 +452,44 @@ def test_detect_client_edits(tmp_path: Path) -> None:
     publish_root = tmp_path / "publish"
     publish_root.mkdir()
 
-    # Write a staged file and record its output_hash in prior_published
-    note_rel = "notes/alpha.md"
-    note_path = publish_root / note_rel
-    note_path.parent.mkdir(parents=True, exist_ok=True)
-    note_path.write_text("original content", encoding="utf-8")
-    original_hash = content_hash(note_path)
+    # Write two staged files and record their output_hashes in prior_published
+    alpha_rel = "notes/alpha.md"
+    alpha_path = publish_root / alpha_rel
+    alpha_path.parent.mkdir(parents=True, exist_ok=True)
+    alpha_path.write_text("original alpha", encoding="utf-8")
+    alpha_hash = content_hash(alpha_path)
 
-    # Deleted file — not on disk
-    deleted_rel = "notes/deleted.md"
+    beta_rel = "notes/beta.md"
+    beta_path = publish_root / beta_rel
+    beta_path.write_text("original beta", encoding="utf-8")
+    beta_hash = content_hash(beta_path)
 
     prior_published = {
         "files": {
-            note_rel: {"source_hash": "sha256:src", "output_hash": original_hash},
-            deleted_rel: {"source_hash": "sha256:src2", "output_hash": "sha256:someoldhash"},
+            alpha_rel: {"source_hash": "sha256:src_a", "output_hash": alpha_hash},
+            beta_rel: {"source_hash": "sha256:src_b", "output_hash": beta_hash},
         }
     }
 
-    # No edits yet — should return empty list (nothing changed)
+    # No edits yet — both files match their recorded output_hash → no edits
     result = detect_client_edits(publish_root, prior_published, force=False)
-    assert deleted_rel + " (deleted)" in result  # deleted file is always reported
-    assert note_rel not in result
+    assert result == []
 
-    # Now mutate the staged file — simulates a client edit
-    note_path.write_text("client edited this!", encoding="utf-8")
+    # Mutate alpha — simulates a client edit; delete beta — simulates a client deletion
+    alpha_path.write_text("client edited this!", encoding="utf-8")
+    beta_path.unlink()
 
-    # force=False → must raise PublishError listing the edited path
+    # force=False → must raise PublishError listing the edited + deleted paths
     with pytest.raises(PublishError) as exc_info:
         detect_client_edits(publish_root, prior_published, force=False)
-    assert note_rel in str(exc_info.value)
+    assert alpha_rel in str(exc_info.value)
+    assert beta_rel in str(exc_info.value)
 
     # force=True → returns the list without raising
     edited = detect_client_edits(publish_root, prior_published, force=True)
-    assert note_rel in edited
-    assert deleted_rel + " (deleted)" in edited
+    assert alpha_rel in edited
+    # Deleted beta reported as '<rel> (deleted)'
+    assert beta_rel + " (deleted)" in edited
 
 
 # (g) detect_client_edits with no prior PUBLISHED.json → always returns []
