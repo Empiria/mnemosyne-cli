@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mnemosyne_cli.lib.setup import setup_worktree_symlinks
+from mnemosyne_cli.lib.setup import setup_claude_overlay, setup_worktree_symlinks
 
 
 # ---------------------------------------------------------------------------
@@ -224,3 +224,64 @@ def test_source_checkout_given_calls_assume_unchanged(
         target, vault_path, vault_project_path, source_checkout=main_checkout
     )
     assert called == [(main_checkout, target)]
+
+
+# ---------------------------------------------------------------------------
+# setup_claude_overlay — overlay-only coverage (D-C2)
+# ---------------------------------------------------------------------------
+
+
+def test_overlay_only(fixture: tuple[Path, Path, Path]) -> None:
+    """setup_claude_overlay creates .claude/* and does NOT create universal symlinks.
+
+    Asserts:
+    - .claude/settings.json symlink created
+    - at least one .claude/skills/<skill> symlink created
+    - .planning is NOT created
+    - AGENTS.md is NOT created
+    - CLAUDE.md is NOT created
+    """
+    vault_path, target, vault_project_path = fixture
+    setup_claude_overlay(target, vault_path, vault_project_path)
+
+    # Overlay artifacts are present
+    settings_link = target / ".claude" / "settings.json"
+    assert settings_link.is_symlink()
+    assert settings_link.resolve() == (
+        vault_project_path / "claude-config" / "settings.json"
+    ).resolve()
+
+    skill_link = target / ".claude" / "skills" / "mnemosyne-plan"
+    assert skill_link.is_symlink()
+    assert skill_link.resolve() == (
+        vault_path / "agents" / "skills" / "mnemosyne-plan"
+    ).resolve()
+
+    # Universal symlinks are NOT created
+    assert not (target / ".planning").exists()
+    assert not (target / "AGENTS.md").exists()
+    assert not (target / "CLAUDE.md").exists()
+
+
+def test_full_function_preserves_relative_claude_md_symlink(
+    fixture: tuple[Path, Path, Path],
+) -> None:
+    """setup_worktree_symlinks still produces CLAUDE.md as a relative symlink.
+
+    Regression guard for D-D1 / Pitfall 6: the unset branch must keep
+    CLAUDE.md pointing at the literal relative target "AGENTS.md".
+    """
+    vault_path, target, vault_project_path = fixture
+    setup_worktree_symlinks(target, vault_path, vault_project_path)
+
+    claude_link = target / "CLAUDE.md"
+    assert claude_link.is_symlink()
+    assert os.readlink(claude_link) == "AGENTS.md"
+
+    # Universal block still present
+    assert (target / ".planning").is_symlink()
+    assert (target / "AGENTS.md").is_symlink()
+
+    # Overlay still present
+    assert (target / ".claude" / "settings.json").is_symlink()
+    assert (target / ".claude" / "skills" / "mnemosyne-plan").is_symlink()
