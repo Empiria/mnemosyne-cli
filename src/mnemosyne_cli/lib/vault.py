@@ -7,6 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import frontmatter
 import tomli_w
 import typer
 from rich.console import Console
@@ -15,6 +16,18 @@ console = Console()
 error_console = Console(stderr=True, style="bold red")
 
 _CONFIG_PATH = Path("~/.config/mnemosyne/config.toml").expanduser()
+
+
+@dataclass(frozen=True)
+class OperationalHome:
+    """Parsed operational_home frontmatter field from an empiria engagement record.
+
+    vault: name of the registered vault that holds the operational workspace.
+    path: vault-relative path to the project directory (e.g. 'projects/infinite-worlds').
+    """
+
+    vault: str
+    path: str
 
 
 @dataclass
@@ -268,3 +281,85 @@ def resolve_vault_project(client_path: Path, vault_path: Path) -> str | None:
 def project_exists(vault_path: Path, project_rel: str) -> bool:
     """Check if the vault project directory exists."""
     return (vault_path / project_rel).is_dir()
+
+
+def read_operational_home(vault_path: Path, project_rel: str) -> OperationalHome | None:
+    """Read the operational_home field from the empiria-side engagement record.
+
+    project_rel is e.g. 'projects/friendly-fox/infinite-worlds'.
+    The record note is {dir}/{slug}.md per the component.py convention
+    (slug = directory basename — Pitfall 3).
+
+    Returns:
+        OperationalHome if the field is present and well-formed.
+        None if the note does not exist or the field is absent.
+
+    Raises:
+        ValueError if the field is present but malformed (Open Q2 lock:
+        a present-but-malformed operational_home is a config bug — FAIL loudly,
+        never fall through silently to the empiria-resident path).
+    """
+    project_dir = vault_path / project_rel
+    note_path = project_dir / f"{project_dir.name}.md"
+    if not note_path.is_file():
+        return None
+    oh = frontmatter.load(str(note_path)).metadata.get("operational_home")
+    if oh is None:
+        return None
+    if not isinstance(oh, dict) or "vault" not in oh or "path" not in oh:
+        raise ValueError(
+            f"operational_home in {note_path} is malformed: expected a dict with "
+            f"'vault' and 'path' keys, got {oh!r}"
+        )
+    return OperationalHome(vault=str(oh["vault"]), path=str(oh["path"]))
+
+
+def vault_by_name(name: str) -> VaultConfig | None:
+    """Return the registered VaultConfig for *name*, or None if unregistered.
+
+    Linear scan over read_vaults_config(). Returns None when name is absent
+    from [vaults.*] in config.toml.
+    """
+    for v in read_vaults_config():
+        if v.name == name:
+            return v
+    return None
+
+
+def validate_vault_rules() -> list[str]:
+    """Cross-check [[vault_rules]] against the registered [vaults.*] set (D-F1).
+
+    Returns a list of problem strings. Empty list means config is consistent.
+
+    Checks:
+    - Orphan 'from': a vault_rules entry whose 'from' names a vault not in [vaults.*].
+    - Unregistered 'can_read' ref: a can_read target not in [vaults.*].
+
+    Returns [] when no [vaults.*] are registered (empty registry is not an error;
+    the doctor will message it as skipped).
+    """
+    registered = {v.name for v in read_vaults_config()}
+    if not registered:
+        return []
+    rules = get_vault_rules()
+    problems: list[str] = []
+    for frm, can_read_list in rules.items():
+        if frm not in registered:
+            problems.append(f"orphan rule: from='{frm}' not in [vaults.*]")
+        for target in can_read_list:
+            if target not in registered:
+                problems.append(
+                    f"unregistered can_read ref: '{target}' (rule from='{frm}')"
+                )
+    return problems
+
+
+def is_within(root: Path, candidate: Path) -> bool:
+    """Return True if *candidate* resolves inside *root* (containment guard).
+
+    Both paths are resolved before comparison so that symlinks and '..'
+    components cannot bypass the check (Security V5/V12).
+    """
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve()
+    return resolved_candidate == resolved_root or resolved_candidate.is_relative_to(resolved_root)
