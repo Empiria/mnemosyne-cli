@@ -231,6 +231,11 @@ RUN npm install -g @opengsd/get-shit-done-redux \
 # 33.2 UAT — backlog item to upstream into @opengsd/get-shit-done-redux.
 COPY --chmod=0755 community-hooks/*.sh /opt/empiria/community-hooks/
 
+# Run as root so sciontool init can chown mounted volumes before dropping
+# to scion. Requires the podman ExecUser fix (scion PR #XX) so the broker
+# execs as scion to find the tmux socket at /tmp/tmux-1000/.
+USER root
+
 # Login shells reset PATH via /etc/profile, which strips the tool dirs added to
 # the ENV PATH above (/opt/empiria/.venv with mnemosyne, the npm-global bin with
 # qmd/ctx7/gsd, /opt/claude/.local/bin, ~/.local/bin). The agent AND the SCION
@@ -239,11 +244,7 @@ COPY --chmod=0755 community-hooks/*.sh /opt/empiria/community-hooks/
 # Capture the build-time PATH into a profile.d drop-in — sourced AFTER
 # /etc/profile resets PATH — so login shells restore it. Path-agnostic (records
 # whatever PATH this build produced); zz- prefix sorts it last in profile.d.
-# empiria-claude-anvil inherits this drop-in.
-RUN printf 'export PATH="%s:$PATH"\n' "$PATH" > /etc/profile.d/zz-empiria-path.sh && \
+# Must run as root (above) to write /etc/profile.d. anvil inherits the drop-in.
+RUN mkdir -p /etc/profile.d && \
+    printf 'export PATH="%s:$PATH"\n' "$PATH" > /etc/profile.d/zz-empiria-path.sh && \
     chmod 644 /etc/profile.d/zz-empiria-path.sh
-
-# Run as root so sciontool init can chown mounted volumes before dropping
-# to scion. Requires the podman ExecUser fix (scion PR #XX) so the broker
-# execs as scion to find the tmux socket at /tmp/tmux-1000/.
-USER root
