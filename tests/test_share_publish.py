@@ -184,6 +184,55 @@ def test_strip_wikilinks() -> None:
     assert "![[technologies/secret/internal]]" not in result
 
 
+def test_strip_wikilinks_short_form_with_resolver() -> None:
+    """Short-form ``[[name]]`` links are stripped when a resolver maps them to a
+    breach target (Phase 50 resolver-aware strip).
+
+    breach_targets holds full extensionless vault paths; the links are bare
+    basenames that never match literally. The resolver bridges the two.
+    """
+    content = (
+        "Alias: [[uplink-testing|the uplink note]]\n"
+        "Bare: [[buffered-dispatch]]\n"
+        "Embed: ![[uplink-testing]]\n"
+        "Keep: [[some-in-set-note]]\n"
+    )
+    breach_targets = {
+        "technologies/anvil/reference/uplink-testing",
+        "technologies/anvil/learning/buffered-dispatch",
+    }
+    resolved = {
+        "uplink-testing": "technologies/anvil/reference/uplink-testing.md",
+        "buffered-dispatch": "technologies/anvil/learning/buffered-dispatch.md",
+        # resolves, but is NOT a breach target → must be left alone
+        "some-in-set-note": "technologies/anvil/reference/some-in-set-note.md",
+    }
+
+    result = strip_cross_set_wikilinks(
+        content, breach_targets, resolver=lambda t: resolved.get(t)
+    )
+
+    # Breach short-form links neutralised
+    assert "the uplink note" in result          # alias kept
+    assert "[[uplink-testing|the uplink note]]" not in result
+    assert "[[buffered-dispatch]]" not in result  # bare → plain text
+    assert "buffered-dispatch" in result
+    assert "![[uplink-testing]]" not in result    # embed removed
+    # A resolvable but NON-breach short link is untouched
+    assert "[[some-in-set-note]]" in result
+
+
+def test_strip_wikilinks_no_resolver_leaves_short_form() -> None:
+    """Without a resolver, short-form links can't match full-path breach targets
+    and are left intact — documents the backward-compatible fallback."""
+    content = "Bare: [[uplink-testing]]\n"
+    breach_targets = {"technologies/anvil/reference/uplink-testing"}
+
+    result = strip_cross_set_wikilinks(content, breach_targets)  # no resolver
+
+    assert "[[uplink-testing]]" in result
+
+
 # ---------------------------------------------------------------------------
 # (f) Byte-level determinism (D-09)
 # ---------------------------------------------------------------------------

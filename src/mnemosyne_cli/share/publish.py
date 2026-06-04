@@ -44,6 +44,7 @@ import re
 import shlex
 import subprocess
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,27 +146,60 @@ def stage_note(
 # ---------------------------------------------------------------------------
 
 
-def strip_cross_set_wikilinks(content: str, breach_targets: set[str]) -> str:
+def strip_cross_set_wikilinks(
+    content: str,
+    breach_targets: set[str],
+    *,
+    resolver: Callable[[str], str | None] | None = None,
+) -> str:
     """Replace wikilinks to *breach_targets* with alias/display text.
 
     For each wikilink in *content*:
-    - If its base target path is in *breach_targets*:
+    - If its target is a breach target:
       - Embed (``![[...]]``): replaced with empty string.
       - Plain link with alias (``[[target|alias]]``): replaced with alias.
       - Plain link without alias (``[[target]]``): replaced with the bare
         base path.
     - Otherwise the wikilink is left unchanged.
 
+    A link's base is a breach target if its literal base path is in
+    *breach_targets* OR — when *resolver* is supplied — if resolving the base
+    yields a vault-relative path whose extensionless form is in the set.
+
+    The resolver is what makes short-form Obsidian links work. *breach_targets*
+    holds full extensionless vault-relative paths (e.g.
+    ``technologies/anvil/reference/anvil-uplink-testing``), but the common
+    Obsidian link is the bare basename (``[[anvil-uplink-testing]]``), which
+    never matches literally. Passing the walker's resolver (``_index_vault`` +
+    ``_resolve``) maps each link to its real target before the membership test,
+    so short-form and path-qualified links are both neutralised. Without a
+    resolver the function falls back to literal matching (path-qualified links
+    only) — preserving the original Phase 49 behaviour for existing callers.
+
     Reuses the Phase 48 ``WIKILINK_RE`` parser from ``share/wikilinks.py``
     (D-49-12).
 
     Args:
         content:        Raw markdown note body (may include frontmatter text).
-        breach_targets: Set of vault-relative base paths to strip.
+        breach_targets: Set of full extensionless vault-relative breach paths.
+        resolver:       Optional callable mapping a wikilink base to its
+                        resolved vault-relative path (``.md``-suffixed) or
+                        ``None``. Use the walker's resolution so short-form
+                        links are matched.
 
     Returns:
         The modified content string.
     """
+
+    def _is_breach_target(base: str) -> bool:
+        if base in breach_targets:
+            return True
+        if resolver is not None:
+            resolved = resolver(base)
+            if resolved is not None:
+                norm = resolved[:-3] if resolved.endswith(".md") else resolved
+                return norm in breach_targets
+        return False
 
     def replacer(match: re.Match) -> str:  # type: ignore[type-arg]
         inner = match.group(1)
@@ -174,7 +208,7 @@ def strip_cross_set_wikilinks(content: str, breach_targets: set[str]) -> str:
         # Strip heading / block anchor to get the base note path
         base = raw_target.split("#", 1)[0].split("^", 1)[0].strip()
 
-        if base not in breach_targets:
+        if not _is_breach_target(base):
             return match.group(0)  # unchanged
 
         is_embed = match.group(0).startswith("!")
@@ -1135,11 +1169,30 @@ def run_publish(
     # strip_cross_set_wikilinks matches against the extensionless wikilink base,
     # so we strip the .md suffix when building the set (CR-01 fix).
     breach_targets: set[str] = set()
+    strip_resolver: Callable[[str], str | None] | None = None
     if policy == "strip":
         breach_targets = {
             p[:-3] if p.endswith(".md") else p
             for p in set(walk.excluded) | set(walk.breach)
         }
+        # Resolve wikilinks the SAME way the walker did, so short-form links
+        # (`[[anvil-uplink-testing]]`) — not just path-qualified ones — match a
+        # breach target and get stripped. Reuses the walker's basename index and
+        # D-01 resolution. The walk above already succeeded, so no in-closure
+        # link is ambiguous; guard defensively anyway.
+        from mnemosyne_cli.share.walker import (
+            AmbiguousLinkError,
+            _index_vault,
+            _resolve,
+        )
+
+        _strip_index = _index_vault(vault_root)
+
+        def strip_resolver(target: str) -> str | None:
+            try:
+                return _resolve(target, vault_root, _strip_index)
+            except AmbiguousLinkError:
+                return None
 
     # -----------------------------------------------------------------------
     # Step 7: Compute current source hashes + write plan (D-05)
@@ -1223,7 +1276,9 @@ def run_publish(
         # so both paths share a single SPDX-injection code path (WR-03).
         if policy == "strip":
             raw_content = source_abs.read_text(encoding="utf-8")
-            stripped_content = strip_cross_set_wikilinks(raw_content, breach_targets)
+            stripped_content = strip_cross_set_wikilinks(
+                raw_content, breach_targets, resolver=strip_resolver
+            )
             staged_bytes = stage_note(
                 source_abs,
                 dest_abs,

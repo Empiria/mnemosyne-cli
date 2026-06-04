@@ -92,17 +92,17 @@ def run(
     """
     # Normalise OptionInfo sentinels (for programmatic / test invocations where
     # Typer has not processed the defaults yet)
-    if isinstance(client, typer.OptionInfo):  # type: ignore[arg-type]
+    if isinstance(client, typer.models.OptionInfo):  # type: ignore[arg-type]
         client = client.default  # type: ignore[assignment]
-    if isinstance(force, typer.OptionInfo):  # type: ignore[arg-type]
+    if isinstance(force, typer.models.OptionInfo):  # type: ignore[arg-type]
         force = force.default  # type: ignore[assignment]
-    if isinstance(skip_review_check, typer.OptionInfo):  # type: ignore[arg-type]
+    if isinstance(skip_review_check, typer.models.OptionInfo):  # type: ignore[arg-type]
         skip_review_check = skip_review_check.default  # type: ignore[assignment]
-    if isinstance(dry_run, typer.OptionInfo):  # type: ignore[arg-type]
+    if isinstance(dry_run, typer.models.OptionInfo):  # type: ignore[arg-type]
         dry_run = dry_run.default  # type: ignore[assignment]
-    if isinstance(into, typer.OptionInfo):  # type: ignore[arg-type]
+    if isinstance(into, typer.models.OptionInfo):  # type: ignore[arg-type]
         into = into.default  # type: ignore[assignment]
-    if isinstance(no_commit, typer.OptionInfo):  # type: ignore[arg-type]
+    if isinstance(no_commit, typer.models.OptionInfo):  # type: ignore[arg-type]
         no_commit = no_commit.default  # type: ignore[assignment]
 
     try:
