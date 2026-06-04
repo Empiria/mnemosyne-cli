@@ -540,16 +540,26 @@ def test_end_to_end_publish(tmp_path: Path) -> None:
 
     publish_root = target_wc / "imported" / "empiria"
 
-    # SPDX-injected staged notes exist
-    staged_testing = publish_root / "technologies" / "anvil" / "reference" / "testing.md"
-    staged_forms = publish_root / "technologies" / "anvil" / "reference" / "forms.md"
-    assert staged_testing.exists(), "testing.md not staged"
-    assert staged_forms.exists(), "forms.md not staged"
+    # Staged notes exist at FLATTENED paths — the knowledge-type dir (reference)
+    # is dropped so the publish doesn't leak Empiria's taxonomy.
+    staged_testing = publish_root / "anvil" / "testing.md"
+    staged_forms = publish_root / "anvil" / "forms.md"
+    assert staged_testing.exists(), "testing.md not staged at flattened path"
+    assert staged_forms.exists(), "forms.md not staged at flattened path"
+    # Neither the 'technologies' category dir nor the 'reference' knowledge-type
+    # dir survives in the published tree.
+    assert not (publish_root / "technologies").exists(), (
+        "'technologies' category dir leaked into published output"
+    )
 
-    # SPDX frontmatter present
+    # Frontmatter is reduced to ONLY the two SPDX fields — title/tags/created
+    # from the source note must NOT leak.
     post = fm.load(str(staged_testing))
     assert post.metadata.get("SPDX-License-Identifier") == "LicenseRef-Empiria-Test-2026"
     assert "SPDX-FileCopyrightText" in post.metadata
+    assert set(post.metadata.keys()) == {"SPDX-License-Identifier", "SPDX-FileCopyrightText"}, (
+        f"non-SPDX frontmatter leaked: {sorted(post.metadata.keys())}"
+    )
 
     # LICENSE.md, THIRD-PARTY-NOTICES.md, PUBLISHED.json
     assert (publish_root / "LICENSE.md").exists(), "LICENSE.md missing"
@@ -693,7 +703,7 @@ def test_diff_only_rerun(tmp_path: Path) -> None:
     )
 
     # The updated forms.md should have updated content in the target
-    staged_forms = target_wc / "imported" / "empiria" / "technologies" / "anvil" / "reference" / "forms.md"
+    staged_forms = target_wc / "imported" / "empiria" / "anvil" / "forms.md"
     assert staged_forms.exists()
     assert "Added in re-run test" in staged_forms.read_text(encoding="utf-8")
 
@@ -741,7 +751,7 @@ def test_detect_client_edits_blocks(tmp_path: Path) -> None:
     # Mutate a staged note in the target subtree (simulates client edit)
     staged_testing = (
         target_wc / "imported" / "empiria"
-        / "technologies" / "anvil" / "reference" / "testing.md"
+        / "anvil" / "testing.md"
     )
     assert staged_testing.exists(), "staged testing.md not found after first publish"
     staged_testing.write_text("client edited this content!", encoding="utf-8")
@@ -891,7 +901,7 @@ def test_strip_policy_removes_cross_set_links(tmp_path: Path) -> None:
     assert result.published is True
 
     publish_root = target_wc / "imported" / "empiria"
-    staged_testing = publish_root / "technologies" / "anvil" / "reference" / "testing.md"
+    staged_testing = publish_root / "anvil" / "testing.md"
     assert staged_testing.exists(), "testing.md not staged under strip policy"
 
     staged_content = staged_testing.read_text(encoding="utf-8")
@@ -987,7 +997,7 @@ def test_local_mode_publish(tmp_path: Path) -> None:
     push_mock.assert_not_called()  # local mode NEVER pushes
 
     publish_root = clone / "context" / "empiria"
-    staged_testing = publish_root / "technologies" / "anvil" / "reference" / "testing.md"
+    staged_testing = publish_root / "anvil" / "testing.md"
     assert staged_testing.exists(), "slice not written under context/empiria"
     assert (publish_root / "LICENSE.md").exists()
     assert (publish_root / "THIRD-PARTY-NOTICES.md").exists()

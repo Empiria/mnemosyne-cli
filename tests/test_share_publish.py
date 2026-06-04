@@ -31,6 +31,7 @@ from mnemosyne_cli.share.publish import (
     detect_client_edits,
     extract_third_party,
     load_published_json,
+    published_relpath,
     render_license,
     render_third_party_notices,
     stage_note,
@@ -79,6 +80,48 @@ def test_spdx_injection(tmp_path: Path) -> None:
     source = frontmatter.load(str(TESTING_MD))
     assert "SPDX-License-Identifier" not in source.metadata
     assert "SPDX-FileCopyrightText" not in source.metadata
+
+
+def test_stage_note_strips_non_spdx_frontmatter(tmp_path: Path) -> None:
+    """Staged output carries ONLY the two SPDX fields — source frontmatter
+    (title/tags/created/type/etc.) must not leak into the client publish."""
+    import frontmatter
+
+    # The fixture testing.md has title/tags/created frontmatter.
+    src_meta = frontmatter.load(str(TESTING_MD)).metadata
+    assert "tags" in src_meta and "title" in src_meta  # precondition
+
+    dest = tmp_path / "out.md"
+    stage_note(
+        TESTING_MD,
+        dest,
+        client_spdx_identifier=CLIENT_SPDX,
+        copyright_text=COPYRIGHT_TEXT,
+    )
+
+    staged = frontmatter.load(str(dest))
+    assert set(staged.metadata.keys()) == {
+        "SPDX-License-Identifier",
+        "SPDX-FileCopyrightText",
+    }, f"non-SPDX frontmatter leaked: {sorted(staged.metadata.keys())}"
+
+
+def test_published_relpath() -> None:
+    """A leading 'technologies' category dir AND intermediate knowledge-type
+    tiers are dropped; the filename and other directories are preserved."""
+    assert (
+        published_relpath("technologies/anvil/reference/playwright-patterns.md")
+        == "anvil/playwright-patterns.md"
+    )
+    assert published_relpath("technologies/anvil/learning/x.md") == "anvil/x.md"
+    assert published_relpath("technologies/python/decision/y.md") == "python/y.md"
+    assert published_relpath("technologies/foo/standard/z.md") == "foo/z.md"
+    # Leading 'technologies' dropped even with no type tier
+    assert published_relpath("technologies/anvil/index.md") == "anvil/index.md"
+    # Non-'technologies' top-level dir is preserved; only the type tier is dropped
+    assert published_relpath("research/foo/reference/x.md") == "research/foo/x.md"
+    # Bare filename → unchanged
+    assert published_relpath("note.md") == "note.md"
 
 
 # ---------------------------------------------------------------------------

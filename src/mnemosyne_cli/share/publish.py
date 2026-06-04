@@ -85,6 +85,67 @@ def content_hash(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# published_relpath — client-facing path mapping
+# ---------------------------------------------------------------------------
+
+# Empiria's four knowledge-note content types (technologies/knowledge-standards.md)
+# are encoded as directory tiers (technologies/<tech>/<type>/<note>.md). Those
+# tier names leak the internal taxonomy into a client publish, so they are
+# dropped from the published path — the same concern as stripping `type:` from
+# the staged frontmatter.
+_KNOWLEDGE_TYPE_DIRS: frozenset[str] = frozenset(
+    {"reference", "learning", "decision", "standard"}
+)
+
+# Top-level vault category directories stripped from the published path — they
+# expose the vault's internal organisation rather than anything the client needs.
+_VAULT_CATEGORY_DIRS: frozenset[str] = frozenset({"technologies"})
+
+
+def published_relpath(source_rel: str) -> str:
+    """Map a source vault-relative note path to its client-facing published path.
+
+    Two layers of Empiria-internal structure are stripped so the publish does
+    not leak the vault's organisation:
+
+    1. A *leading* top-level category directory (``technologies``).
+    2. Any *intermediate* knowledge-type directory tier (``reference`` /
+       ``learning`` / ``decision`` / ``standard``).
+
+    The filename is always kept; the tech name (and any other directories) are
+    preserved.
+
+    Example: ``technologies/anvil/reference/playwright-patterns.md`` →
+    ``anvil/playwright-patterns.md``.
+
+    Note: short-form Obsidian links (``[[name]]``) are unaffected by flattening
+    (they resolve by basename). A full-path in-set link that embeds the stripped
+    structure (``[[technologies/anvil/reference/forms]]``) is NOT rewritten and
+    would not resolve post-flatten — callers relying on that should prefer
+    short-form links.
+
+    Args:
+        source_rel: Vault-relative POSIX path of the source note.
+
+    Returns:
+        The client-facing vault-relative POSIX path.
+    """
+    parts = source_rel.split("/")
+    if len(parts) <= 1:
+        return source_rel
+    # 1. Drop a leading category dir (keep the filename if that's all there is).
+    if parts[0] in _VAULT_CATEGORY_DIRS and len(parts) > 1:
+        parts = parts[1:]
+    # 2. Drop intermediate knowledge-type tiers.
+    kept = [
+        p
+        for i, p in enumerate(parts)
+        if not (i < len(parts) - 1 and p in _KNOWLEDGE_TYPE_DIRS)
+    ]
+    return "/".join(kept)
+
+
+# ---------------------------------------------------------------------------
 # stage_note
 # ---------------------------------------------------------------------------
 
@@ -125,17 +186,23 @@ def stage_note(
     else:
         post = frontmatter.load(str(source_path))
 
-    # D-12: third-party override — use the note's own spdx: value if present
+    # D-12: third-party override — use the note's own spdx: value if present.
+    # Read it from the SOURCE metadata before discarding the rest.
     source_spdx = post.metadata.get("spdx")
     if source_spdx:
         spdx_identifier = str(source_spdx)
     else:
         spdx_identifier = client_spdx_identifier
 
-    post["SPDX-License-Identifier"] = spdx_identifier
-    post["SPDX-FileCopyrightText"] = copyright_text
+    # Client-facing output carries ONLY the two SPDX fields. All source
+    # frontmatter (type, tags, created/updated, internal provenance) is dropped
+    # so the publish does not leak Empiria's internal note schema. A fresh Post
+    # built from the body is the single source of the staged metadata.
+    staged = frontmatter.Post(post.content)
+    staged["SPDX-License-Identifier"] = spdx_identifier
+    staged["SPDX-FileCopyrightText"] = copyright_text
 
-    content = frontmatter.dumps(post)
+    content = frontmatter.dumps(staged)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_path.write_text(content, encoding="utf-8")
     return content.encode("utf-8")
@@ -568,6 +635,10 @@ def detect_client_edits(
     *prior_published*[``"files"``] against the stored ``output_hash`` (the
     hash of the file as Empiria last wrote it).  A mismatch means the client
     modified or deleted the file.
+
+    ``"files"`` keys are client-facing published paths (see
+    :func:`published_relpath`), so they locate the on-disk file under
+    *publish_root* directly.
 
     NOTE: Only the entries in ``"files"`` are checked.  Sibling files such as
     ``LICENSE.md`` and ``THIRD-PARTY-NOTICES.md`` are Empiria-generated
@@ -1195,13 +1266,34 @@ def run_publish(
                 return None
 
     # -----------------------------------------------------------------------
-    # Step 7: Compute current source hashes + write plan (D-05)
+    # Step 7: Map in-set source notes to their client-facing published paths,
+    #         then compute current hashes + write plan (D-05).
+    #
+    # The whole diff pipeline and PUBLISHED.json key on the PUBLISHED path (not
+    # the source path) so the client artefact never leaks the source layout
+    # (the stripped category/knowledge-type dirs). `pub_to_source` is the 1:1
+    # inverse used to read source content for staging.
+    #
+    # Guard: flattening must not collapse two distinct source notes onto the
+    # same published path (e.g. anvil/reference/x.md and anvil/learning/x.md
+    # both → anvil/x.md). Fail fast rather than silently overwrite.
     # -----------------------------------------------------------------------
+    pub_to_source: dict[str, str] = {}
     current_sources: dict[str, str] = {}
     for rel_str in walk.in_set:
         source_abs = vault_root / rel_str
-        if source_abs.exists():
-            current_sources[rel_str] = content_hash(source_abs)
+        if not source_abs.exists():
+            continue
+        pub = published_relpath(rel_str)
+        if pub in pub_to_source and pub_to_source[pub] != rel_str:
+            raise PublishError(
+                f"run_publish: publish-path collision — '{pub_to_source[pub]}' and "
+                f"'{rel_str}' both map to '{pub}' after stripping category / "
+                f"knowledge-type directories. Rename one source note, or narrow "
+                f"the include set."
+            )
+        pub_to_source[pub] = rel_str
+        current_sources[pub] = content_hash(source_abs)
 
     plan = compute_write_plan(current_sources, prior)
 
@@ -1264,12 +1356,16 @@ def run_publish(
     if prior:
         file_hashes.update(prior.get("files", {}))
 
-    for rel_str in plan.to_write:
-        source_abs = vault_root / rel_str
+    # plan.to_write/to_delete carry PUBLISHED paths; pub_to_source maps each
+    # back to its source note for reading content.
+    for pub_rel in plan.to_write:
+        source_rel = pub_to_source.get(pub_rel)
+        if source_rel is None:
+            continue
+        source_abs = vault_root / source_rel
         if not source_abs.exists():
             continue
-        # Preserve vault-relative path under target_subtree (Open Q2)
-        dest_abs = publish_root / rel_str
+        dest_abs = publish_root / pub_rel
         dest_abs.parent.mkdir(parents=True, exist_ok=True)
 
         # Apply strip transform for 'strip' policy, then stage via stage_note
@@ -1297,24 +1393,24 @@ def run_publish(
         in_set_paths.append(source_abs)
         src_hash = content_hash(source_abs)
         out_hash = "sha256:" + hashlib.sha256(staged_bytes).hexdigest()
-        file_hashes[rel_str] = {
+        file_hashes[pub_rel] = {
             "source_hash": src_hash,
             "output_hash": out_hash,
         }
 
     # Also populate in_set_paths for notes NOT in plan.to_write (unchanged)
-    for rel_str in walk.in_set:
-        if rel_str not in plan.to_write:
-            source_abs = vault_root / rel_str
+    for pub_rel, source_rel in pub_to_source.items():
+        if pub_rel not in plan.to_write:
+            source_abs = vault_root / source_rel
             if source_abs.exists():
                 in_set_paths.append(source_abs)
 
-    # Delete removed files from publish_root
-    for rel_str in plan.to_delete:
-        dest_abs = publish_root / rel_str
+    # Delete removed files from publish_root (keys are client-facing paths)
+    for pub_rel in plan.to_delete:
+        dest_abs = publish_root / pub_rel
         if dest_abs.exists():
             dest_abs.unlink()
-        file_hashes.pop(rel_str, None)
+        file_hashes.pop(pub_rel, None)
 
     # Render LICENSE.md
     template_path_rel = license_block.get("template", "")
@@ -1374,6 +1470,8 @@ def run_publish(
     # plus the three generated artefacts.  Staging the whole subtree directory
     # would sweep any pre-existing client stray files into the Empiria commit
     # (WR-02).
+    # plan.to_write/to_delete are already client-facing (published) paths, which
+    # is exactly where the files were written — stage them directly.
     subtree_prefix = target_subtree.rstrip("/") + "/"
     stage_paths: list[str] = (
         [subtree_prefix + p for p in plan.to_write]
