@@ -851,8 +851,14 @@ def git_commit(repo_path: Path, paths: list[str], message: str) -> bool:
         capture_output=True,
         text=True,
     )
+    # Scope the commit itself to the explicit pathspec (not just the staging).
+    # In local mode the target is an actively-developed client code repo whose
+    # index may already carry unrelated staged changes; a bare `git commit`
+    # would sweep those into the Empiria publish commit. Committing with `--
+    # <paths>` commits ONLY the publish artefacts and leaves any other staged
+    # work untouched (completes the WR-02 intent for the in-repo case).
     result = subprocess.run(
-        ["git", "commit", "-m", message],
+        ["git", "commit", "-m", message, "--"] + paths,
         cwd=repo_path,
         capture_output=True,
         text=True,
@@ -940,7 +946,8 @@ class PublishResult:
 
     Attributes:
         success:   True if the operation completed without error.
-        published: True if a new commit was created and pushed.
+        published: True if a new commit was created (and, in vault mode, pushed);
+                   also True for a successful ``--no-commit`` working-tree write.
         message:   Human-readable summary message.
     """
 
@@ -955,28 +962,51 @@ def run_publish(
     force: bool,
     skip_review_check: bool,
     dry_run: bool,
+    into: str | Path | None = None,
+    commit: bool = True,
 ) -> "PublishResult":
     """End-to-end publish orchestrator — §4.3 steps 5–9 pipeline.
+
+    Two target mechanisms (Phase 50):
+
+    - **LOCAL MODE (default for in-repo colocation)** — pass *into* pointing at
+      a local git clone (e.g. a client code repo). The published slice is
+      written under ``<into>/<target_subtree>`` and committed there, and the
+      function returns; **the push is NOT performed** — transport is the
+      operator's responsibility. The ``vault_can_read`` gate and the
+      clean-worktree-outside-subtree check do not apply (the target is a plain
+      git repo being actively developed, not a registered vault). No deploy key
+      is required. A manifest whose ``[direct]`` block omits ``target_vault`` is
+      local-only and *requires* *into*.
+    - **VAULT MODE (legacy direct publish)** — *into* is ``None`` and the
+      manifest names a registered ``[direct].target_vault``: resolve it, enforce
+      ``[[vault_rules]]``, commit, and push ``origin main`` via the deploy key.
 
     Pipeline (49-RESEARCH Pattern 2):
 
     1. Resolve vault_root (empiria) + load config. Load manifest.
     2. ``check_review_gate`` (D-10); warn if skip_review_check.
-    3. ``check_target_registered`` (D-02); ``validate_publish_root_under_target``.
-    4. ``check_worktree_clean`` (D-02) — unless dry_run.
+    3. Resolve target: *into* (local mode) or ``check_target_registered``
+       (vault mode); ``validate_publish_root_under_target``.
+    4. ``check_worktree_clean`` (D-02) — vault mode only, unless dry_run.
     5. Load ``PUBLISHED.json``. ``detect_client_edits`` (D-04).
     6. ``walk_manifest`` (Phase 48). Apply policy: refuse / warn / strip (D-49-12).
     7. Compute ``current_sources``. ``compute_write_plan`` (D-05).
     8. NO-OP GATE (D-06) — must precede all writes.
     9. Stage + LICENSE + THIRD-PARTY + PUBLISHED.json (guarded by dry_run).
     10. If dry_run → print plan, return published=False.
-    11. commit + deploy-key push (D-03).
+    11. commit (local + vault) + deploy-key push (vault mode only, D-03).
 
     Args:
         client:             Client slug (e.g. ``"friendly-fox"``).
         force:              Override detect-and-refuse (D-04).
         skip_review_check:  Bypass licence review gate (loud warning; D-10).
         dry_run:            Show the plan, write nothing to the target.
+        into:               Local clone path → LOCAL MODE (write + commit, no
+                            push). ``None`` → VAULT MODE.
+        commit:             If ``False``, write the slice into the working tree
+                            but do not stage/commit it (operator commits). Only
+                            meaningful with *into*.
 
     Returns:
         :class:`PublishResult`.
@@ -1027,18 +1057,53 @@ def run_publish(
         )
 
     # -----------------------------------------------------------------------
-    # Step 3: Target registration + publish-root validation (D-02)
+    # Step 3: Resolve publish target + publish-root validation (D-02)
+    #
+    # --into forces LOCAL MODE: write + commit into a local clone, no push,
+    # no vault_can_read gate. With no --into, a manifest carrying a
+    # target_vault uses VAULT MODE (legacy: registered vault + deploy-key push);
+    # a manifest without target_vault is local-only and requires --into.
     # -----------------------------------------------------------------------
-    target_vault_path = check_target_registered(manifest, config)
     direct = manifest.direct or {}
     target_subtree = direct.get("target_subtree", "imported/empiria")
-    publish_root = validate_publish_root_under_target(target_vault_path, target_subtree)
+
+    if into is not None:
+        local_mode = True
+        target_root = Path(into).expanduser().resolve()
+        if not target_root.is_dir():
+            raise PublishError(
+                f"run_publish: --into path does not exist or is not a directory: "
+                f"{target_root}"
+            )
+        if not (target_root / ".git").exists():
+            raise PublishError(
+                f"run_publish: --into path is not a git repository (no .git): "
+                f"{target_root}\n"
+                f"tech-publish commits the published slice locally; point --into "
+                f"at a git clone."
+            )
+    elif direct.get("target_vault"):
+        local_mode = False
+        target_root = check_target_registered(manifest, config)
+    else:
+        raise PublishError(
+            "run_publish: manifest [direct] has no 'target_vault' (local-mode "
+            "manifest), but no --into <path> was supplied.\n"
+            "Pass the local clone to publish into:\n"
+            f"  mnemosyne tech-publish --client {client} --into /path/to/clone"
+        )
+
+    publish_root = validate_publish_root_under_target(target_root, target_subtree)
 
     # -----------------------------------------------------------------------
-    # Step 4: Dirty-worktree check (D-02) — skipped in dry_run
+    # Step 4: Dirty-worktree check (D-02) — VAULT MODE only, skipped in dry_run.
+    # In local mode the target is an actively-developed code repo whose working
+    # tree is routinely dirty; we stage only explicit subtree paths at commit
+    # time (and commit with an explicit pathspec), so a dirty tree elsewhere is
+    # fine and must not block.
     # -----------------------------------------------------------------------
-    if not dry_run:
-        check_worktree_clean(target_vault_path, target_subtree)
+    if not dry_run and not local_mode:
+        check_worktree_clean(target_root, target_subtree)
 
     # -----------------------------------------------------------------------
     # Step 5: Load PUBLISHED.json + detect client edits (D-04)
@@ -1243,13 +1308,8 @@ def run_publish(
     write_published_json(publish_root, published_data)
 
     # -----------------------------------------------------------------------
-    # Step 12 (already handled above for dry_run; this is the non-dry path)
-    # Step 13: commit + deploy-key push (D-03)
+    # Step 13: commit (local + vault) + deploy-key push (vault mode only, D-03)
     # -----------------------------------------------------------------------
-    # Resolve deploy key (D-01) — ONLY consumed by git_push_with_deploy_key
-    deploy_key_ref = direct.get("deploy_key_ref", "")
-    key_path = resolve_deploy_key(deploy_key_ref)
-
     scope_summary = derive_scope_summary(plan.to_write, plan.to_delete)
     commit_message = (
         f"Empiria publish: {scope_summary}, source @ {source_vault_sha}"
@@ -1270,33 +1330,66 @@ def run_publish(
         ]
     )
 
+    # --no-commit: leave the written slice in the working tree for the operator
+    # to inspect, stage, and commit. Short-circuits before any deploy-key work.
+    if not commit:
+        return PublishResult(
+            success=True,
+            published=True,
+            message=(
+                f"Wrote {scope_summary} to {publish_root} (--no-commit). "
+                f"Review, then commit and push yourself."
+            ),
+        )
+
+    # Vault mode resolves + validates the deploy key BEFORE committing, so a
+    # missing key fails fast without leaving a commit (D-01). Local mode never
+    # pushes, so no key is needed.
+    key_path: Path | None = None
+    if not local_mode:
+        deploy_key_ref = direct.get("deploy_key_ref", "")
+        key_path = resolve_deploy_key(deploy_key_ref)
+
     committed = git_commit(
-        target_vault_path,
+        target_root,
         stage_paths,
         commit_message,
     )
-    if committed:
-        # WR-01: wrap push failure so operators get an actionable message
-        # (raw CalledProcessError bypasses the Typer except PublishError handler).
-        # The local commit is intentionally preserved — it can be pushed manually.
-        try:
-            git_push_with_deploy_key(target_vault_path, key_path)
-        except subprocess.CalledProcessError as exc:
-            raise PublishError(
-                f"run_publish: the commit was created in the target repo but the "
-                f"push to origin failed (exit {exc.returncode}).\n"
-                f"The commit is still present in the local target clone — push it "
-                f"manually once the remote is reachable:\n"
-                f"  cd <target-vault> && git push origin main\n"
-                f"stderr: {exc.stderr}"
-            ) from exc
-    else:
+    if not committed:
         # Nothing actually changed on disk — treat as no-op
         return PublishResult(
             success=True,
             published=False,
             message="nothing to publish",
         )
+
+    if local_mode:
+        # Transport is the operator's responsibility (Phase 50): commit only.
+        return PublishResult(
+            success=True,
+            published=True,
+            message=(
+                f"Published locally (committed; push handled externally): "
+                f"{scope_summary}, source @ {source_vault_sha}"
+            ),
+        )
+
+    # Vault mode: push origin main via the deploy key.
+    # WR-01: wrap push failure so operators get an actionable message
+    # (raw CalledProcessError bypasses the Typer except PublishError handler).
+    # The local commit is intentionally preserved — it can be pushed manually.
+    assert key_path is not None  # set above in vault mode
+    try:
+        git_push_with_deploy_key(target_root, key_path)
+    except subprocess.CalledProcessError as exc:
+        raise PublishError(
+            f"run_publish: the commit was created in the target repo but the "
+            f"push to origin failed (exit {exc.returncode}).\n"
+            f"The commit is still present in the local target clone — push it "
+            f"manually once the remote is reachable:\n"
+            f"  cd <target-vault> && git push origin main\n"
+            f"stderr: {exc.stderr}"
+        ) from exc
 
     return PublishResult(
         success=True,

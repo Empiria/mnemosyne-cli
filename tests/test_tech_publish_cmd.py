@@ -10,8 +10,17 @@ Tests cover:
   (g) test_diff_only_rerun          — D-05: one changed note → exactly one new commit
   (h) test_detect_client_edits_blocks — D-04: client edit → blocked; --force passes
   (i) test_dry_run_writes_nothing   — dry_run=True → no files, no commit
+  (j) test_strip_policy_removes_cross_set_links — CR-01 regression
 
-All tests use a local file:// bare git remote — no network, no real deploy key.
+Phase 50 — LOCAL MODE (in-repo colocation):
+  (k) test_local_mode_publish       — --into writes + commits, never pushes, no key
+  (l) test_local_mode_no_commit     — --no-commit writes working tree, no commit
+  (m) test_local_mode_requires_into — local-mode manifest + no --into → error
+  (n) test_local_mode_ignores_dirty_outside — code-repo tree may be dirty; no sweep
+  (o) test_local_mode_idempotent_rerun — D-06 no-op holds in local mode
+
+Vault-mode tests use a local file:// bare git remote — no network, no real deploy
+key. Local-mode tests use a plain local clone and assert the push is never called.
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -146,14 +155,18 @@ def _make_target_repo(tmp_path: Path, name: str = "target-vault") -> tuple[Path,
 
 def _make_manifest_toml(
     client: str = "testclient",
-    target_vault: str = "client-vault",
+    target_vault: str | None = "client-vault",
     target_subtree: str = "imported/empiria",
     deploy_key_ref: str = "client-deploy",
     policy: str = "refuse",
     reviewed_at: str | None = "2026-06-01",
     extra_license: dict[str, Any] | None = None,
 ) -> str:
-    """Return a share-manifest.toml string."""
+    """Return a share-manifest.toml string.
+
+    Pass ``target_vault=None`` to produce a LOCAL-MODE manifest (omits both
+    ``target_vault`` and ``deploy_key_ref``) — Phase 50 in-repo colocation.
+    """
     lines = [
         "[client]",
         f'slug = "{client}"',
@@ -161,9 +174,13 @@ def _make_manifest_toml(
         'mode = "direct"',
         "",
         "[direct]",
-        f'target_vault = "{target_vault}"',
-        f'target_subtree = "{target_subtree}"',
-        f'deploy_key_ref = "{deploy_key_ref}"',
+    ]
+    if target_vault is not None:
+        lines.append(f'target_vault = "{target_vault}"')
+    lines.append(f'target_subtree = "{target_subtree}"')
+    if target_vault is not None:
+        lines.append(f'deploy_key_ref = "{deploy_key_ref}"')
+    lines += [
         "",
         "[include]",
         'paths = ["technologies/anvil/reference/**"]',
@@ -905,3 +922,234 @@ def test_strip_policy_removes_cross_set_links(tmp_path: Path) -> None:
     assert "SPDX-FileCopyrightText" in post.metadata, (
         "SPDX-FileCopyrightText not injected in strip-path staged note"
     )
+
+
+# ===========================================================================
+# Phase 50 — LOCAL MODE (in-repo colocation)
+#
+# A local-mode manifest omits target_vault/deploy_key_ref; the operator supplies
+# the local clone path via `into=`. tech-publish writes <clone>/<subtree>, commits
+# locally, and NEVER pushes (transport is the operator's responsibility).
+# ===========================================================================
+
+
+def _make_local_clone(tmp_path: Path, name: str = "iw-clone") -> Path:
+    """A plain local git repo (stand-in for the IW code clone) — no origin needed."""
+    wc = tmp_path / name
+    wc.mkdir()
+    subprocess.run(["git", "init"], cwd=wc, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "dev@example.com"], cwd=wc, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Dev"], cwd=wc, check=True, capture_output=True)
+    (wc / "anvil.yaml").write_text("# anvil app\n")
+    subprocess.run(["git", "add", "-A"], cwd=wc, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init app"], cwd=wc, check=True, capture_output=True)
+    return wc
+
+
+# ---------------------------------------------------------------------------
+# (k) test_local_mode_publish — writes + commits, never pushes, no deploy key
+# ---------------------------------------------------------------------------
+
+
+def test_local_mode_publish(tmp_path: Path) -> None:
+    """--into a local clone: writes context/empiria, commits, NO push, no key."""
+    import frontmatter as fm
+
+    vault = _make_vault(tmp_path, client="friendly-fox")
+    clone = _make_local_clone(tmp_path)
+
+    toml = _make_manifest_toml(
+        client="friendly-fox",
+        target_vault=None,  # local-mode manifest
+        target_subtree="context/empiria",
+    )
+    _write_manifest(vault, "friendly-fox", toml)
+
+    config = _make_config_toml(vault, "unused", clone)
+    push_mock = MagicMock()
+    initial_commits = _git_log_count(clone)
+
+    with (
+        patch("mnemosyne_cli.lib.vault.resolve_vault_path", return_value=vault),
+        patch("mnemosyne_cli.lib.vault._read_config", return_value=config),
+        patch("mnemosyne_cli.share.publish.git_push_with_deploy_key", push_mock),
+    ):
+        result = run_publish(
+            client="friendly-fox",
+            force=False,
+            skip_review_check=False,
+            dry_run=False,
+            into=str(clone),
+        )
+
+    assert result.success is True
+    assert result.published is True
+    push_mock.assert_not_called()  # local mode NEVER pushes
+
+    publish_root = clone / "context" / "empiria"
+    staged_testing = publish_root / "technologies" / "anvil" / "reference" / "testing.md"
+    assert staged_testing.exists(), "slice not written under context/empiria"
+    assert (publish_root / "LICENSE.md").exists()
+    assert (publish_root / "THIRD-PARTY-NOTICES.md").exists()
+    assert (publish_root / "PUBLISHED.json").exists()
+
+    post = fm.load(str(staged_testing))
+    assert post.metadata.get("SPDX-License-Identifier") == "LicenseRef-Empiria-Test-2026"
+    assert "SPDX-FileCopyrightText" in post.metadata
+
+    # Exactly one local commit; message carries the publish prefix
+    assert _git_log_count(clone) == initial_commits + 1
+    assert any("Empiria publish:" in m for m in _git_log_messages(clone))
+
+
+# ---------------------------------------------------------------------------
+# (l) test_local_mode_no_commit — writes the working tree but does not commit
+# ---------------------------------------------------------------------------
+
+
+def test_local_mode_no_commit(tmp_path: Path) -> None:
+    """--no-commit (local mode): files written, NO commit, no deploy key."""
+    vault = _make_vault(tmp_path, client="friendly-fox")
+    clone = _make_local_clone(tmp_path)
+
+    toml = _make_manifest_toml(
+        client="friendly-fox", target_vault=None, target_subtree="context/empiria"
+    )
+    _write_manifest(vault, "friendly-fox", toml)
+    config = _make_config_toml(vault, "unused", clone)
+    initial_commits = _git_log_count(clone)
+
+    with (
+        patch("mnemosyne_cli.lib.vault.resolve_vault_path", return_value=vault),
+        patch("mnemosyne_cli.lib.vault._read_config", return_value=config),
+    ):
+        result = run_publish(
+            client="friendly-fox",
+            force=False,
+            skip_review_check=False,
+            dry_run=False,
+            into=str(clone),
+            commit=False,
+        )
+
+    assert result.success is True
+    assert result.published is True
+    assert "--no-commit" in result.message
+
+    # Files written to the working tree …
+    assert (clone / "context" / "empiria" / "PUBLISHED.json").exists()
+    # … but NO commit was created
+    assert _git_log_count(clone) == initial_commits
+
+
+# ---------------------------------------------------------------------------
+# (m) test_local_mode_requires_into — local-mode manifest with no --into errors
+# ---------------------------------------------------------------------------
+
+
+def test_local_mode_requires_into(tmp_path: Path) -> None:
+    """A manifest with no target_vault and no --into → actionable PublishError."""
+    vault = _make_vault(tmp_path, client="friendly-fox")
+
+    toml = _make_manifest_toml(
+        client="friendly-fox", target_vault=None, target_subtree="context/empiria"
+    )
+    _write_manifest(vault, "friendly-fox", toml)
+    config = _make_config_toml(vault, "unused", vault)
+
+    with (
+        patch("mnemosyne_cli.lib.vault.resolve_vault_path", return_value=vault),
+        patch("mnemosyne_cli.lib.vault._read_config", return_value=config),
+    ):
+        with pytest.raises(PublishError) as exc_info:
+            run_publish(
+                client="friendly-fox",
+                force=False,
+                skip_review_check=False,
+                dry_run=False,
+            )
+    assert "--into" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# (n) test_local_mode_ignores_dirty_outside — code repo tree may be dirty
+# ---------------------------------------------------------------------------
+
+
+def test_local_mode_ignores_dirty_outside(tmp_path: Path) -> None:
+    """Local mode must NOT block on a dirty tree outside the subtree, and must
+    NOT sweep unrelated changes into the publish commit (explicit pathspec)."""
+    vault = _make_vault(tmp_path, client="friendly-fox")
+    clone = _make_local_clone(tmp_path)
+
+    toml = _make_manifest_toml(
+        client="friendly-fox", target_vault=None, target_subtree="context/empiria"
+    )
+    _write_manifest(vault, "friendly-fox", toml)
+    config = _make_config_toml(vault, "unused", clone)
+
+    # Active code work in progress, outside the publish subtree
+    (clone / "client_code.py").write_text("# work in progress\n")
+
+    with (
+        patch("mnemosyne_cli.lib.vault.resolve_vault_path", return_value=vault),
+        patch("mnemosyne_cli.lib.vault._read_config", return_value=config),
+        patch("mnemosyne_cli.share.publish.git_push_with_deploy_key", MagicMock()),
+    ):
+        result = run_publish(
+            client="friendly-fox",
+            force=False,
+            skip_review_check=False,
+            dry_run=False,
+            into=str(clone),
+        )
+
+    assert result.published is True
+    # The unrelated file is still uncommitted — the publish commit did not grab it
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=clone, capture_output=True, text=True, check=True,
+    ).stdout
+    assert "client_code.py" in status, "unrelated dirty file should remain uncommitted"
+
+
+# ---------------------------------------------------------------------------
+# (o) test_local_mode_idempotent_rerun — D-06 holds in local mode
+# ---------------------------------------------------------------------------
+
+
+def test_local_mode_idempotent_rerun(tmp_path: Path) -> None:
+    """Second local-mode run with zero source changes is a no-op (no new commit)."""
+    vault = _make_vault(tmp_path, client="friendly-fox")
+    clone = _make_local_clone(tmp_path)
+
+    toml = _make_manifest_toml(
+        client="friendly-fox", target_vault=None, target_subtree="context/empiria"
+    )
+    _write_manifest(vault, "friendly-fox", toml)
+    config = _make_config_toml(vault, "unused", clone)
+
+    patches = (
+        patch("mnemosyne_cli.lib.vault.resolve_vault_path", return_value=vault),
+        patch("mnemosyne_cli.lib.vault._read_config", return_value=config),
+        patch("mnemosyne_cli.share.publish.git_push_with_deploy_key", MagicMock()),
+    )
+
+    with patches[0], patches[1], patches[2]:
+        r1 = run_publish(
+            client="friendly-fox", force=False, skip_review_check=False,
+            dry_run=False, into=str(clone),
+        )
+        assert r1.published is True
+
+    commits_after_first = _git_log_count(clone)
+
+    with patches[0], patches[1], patches[2]:
+        r2 = run_publish(
+            client="friendly-fox", force=False, skip_review_check=False,
+            dry_run=False, into=str(clone),
+        )
+        assert r2.published is False
+        assert "nothing" in r2.message.lower()
+
+    assert _git_log_count(clone) == commits_after_first

@@ -1,10 +1,17 @@
-"""mnemosyne tech-publish — publish the tech sharing set to a client vault (direct mode).
+"""mnemosyne tech-publish — publish the tech sharing set into a client target.
 
 Implements the §4.3 steps 5–9 pipeline end-to-end:
 - Stage the closure walker's in-set with SPDX frontmatter injection.
 - Render LICENSE.md and THIRD-PARTY-NOTICES.md.
 - Write PUBLISHED.json provenance.
-- Commit and push to the target vault via a deploy key.
+- Commit the slice; push only in vault mode.
+
+Two target mechanisms (Phase 50):
+- LOCAL MODE (default for in-repo colocation): ``--into <path>`` writes + commits
+  the slice into a local git clone (e.g. a client code repo) and does NOT push —
+  the operator handles transport.
+- VAULT MODE (legacy): a manifest naming a registered ``target_vault`` is resolved,
+  committed, and pushed to ``origin main`` via a deploy key.
 
 All logic lives in :func:`~mnemosyne_cli.share.publish.run_publish`; this module
 is a thin Typer adapter.
@@ -46,17 +53,39 @@ def run(
         "--dry-run",
         help=(
             "Show the publish plan (files to write/delete) without making any "
-            "changes to the target vault. No staging, no commit, no push."
+            "changes to the target. No staging, no commit, no push."
+        ),
+    ),
+    into: str = typer.Option(
+        None,
+        "--into",
+        help=(
+            "LOCAL MODE: path to a local git clone (e.g. a client code repo) to "
+            "publish into. Writes <into>/<target_subtree> and commits there; "
+            "does NOT push (you handle transport). The default mechanism for "
+            "in-repo colocation."
+        ),
+    ),
+    no_commit: bool = typer.Option(
+        False,
+        "--no-commit",
+        help=(
+            "LOCAL MODE only: write the slice into the working tree but do not "
+            "stage or commit it — leave that to you. No effect without --into."
         ),
     ),
 ) -> None:
-    """Publish the technology sharing set to a registered client vault (direct mode).
+    """Publish the technology sharing set into a client target.
 
     Resolves the share-manifest for CLIENT, runs the Phase 48 closure walker,
     applies the breach policy (refuse/warn/strip), stages in-set notes with SPDX
     frontmatter, renders LICENSE.md and THIRD-PARTY-NOTICES.md, writes
-    PUBLISHED.json, then commits and pushes to the target's main branch via the
-    configured deploy key.
+    PUBLISHED.json, then commits.
+
+    With ``--into <path>`` (LOCAL MODE — default for in-repo colocation) the
+    slice is written and committed into a local clone and NOT pushed. Without
+    ``--into`` the manifest's registered ``target_vault`` is used (VAULT MODE),
+    and the commit is pushed to the target's main branch via the deploy key.
 
     Re-runs are idempotent: a zero-source-change run prints "nothing to publish"
     and performs no commit/push (D-06).
@@ -71,6 +100,10 @@ def run(
         skip_review_check = skip_review_check.default  # type: ignore[assignment]
     if isinstance(dry_run, typer.OptionInfo):  # type: ignore[arg-type]
         dry_run = dry_run.default  # type: ignore[assignment]
+    if isinstance(into, typer.OptionInfo):  # type: ignore[arg-type]
+        into = into.default  # type: ignore[assignment]
+    if isinstance(no_commit, typer.OptionInfo):  # type: ignore[arg-type]
+        no_commit = no_commit.default  # type: ignore[assignment]
 
     try:
         result: PublishResult = run_publish(
@@ -78,6 +111,8 @@ def run(
             force=bool(force),
             skip_review_check=bool(skip_review_check),
             dry_run=bool(dry_run),
+            into=into,
+            commit=not bool(no_commit),
         )
     except PublishError as exc:
         error_console.print(f"[bold red]Error:[/bold red] {exc}")
