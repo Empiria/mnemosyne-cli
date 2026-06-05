@@ -200,20 +200,19 @@ USER scion
 RUN mkdir -p ~/.dep-cache/uv ~/.dep-cache/ms-playwright ~/.dep-cache/cargo
 
 # GSD: phase-based workflow skills, agents, and hooks for Claude Code.
-# Migrated from gsd-build/get-shit-done-cc to open-gsd/get-shit-done-redux —
-# the new package declares gsd-sdk + gsd-tools as proper bin entries, so npm
-# creates the PATH symlinks natively and the manual `ln -sf` is no longer
-# needed. Two-step install:
-#   1. `npm install -g @opengsd/get-shit-done-redux` puts the installer
-#      (`get-shit-done-redux`) plus `gsd-sdk` and `gsd-tools` on PATH.
-#   2. `get-shit-done-redux --claude --global` runs the installer (writes
-#      config into ~/.claude/; --global is the installer's own flag, NOT
-#      npm -g).
-# The which-checks fail the build if npm did not register the bin entries.
-RUN npm install -g @opengsd/get-shit-done-redux \
- && get-shit-done-redux --claude --global \
+# Migrated open-gsd/get-shit-done-redux -> open-gsd/gsd-core (the project's
+# rename; same @opengsd maintainers, code preserved). gsd-core consolidated
+# the old `gsd-sdk` bin into `gsd-tools` — it now ships only `gsd-core`
+# (installer) + `gsd-tools` as declared bins, so npm creates the PATH symlinks
+# natively and the manual `ln -sf` is not needed. Two-step install:
+#   1. `npm install -g @opengsd/gsd-core` puts the installer (`gsd-core`)
+#      plus `gsd-tools` on PATH.
+#   2. `gsd-core --claude --global` runs the installer (writes config into
+#      ~/.claude/; --global is the installer's own flag, NOT npm -g).
+# The which-check fails the build if npm did not register the bin entry.
+RUN npm install -g @opengsd/gsd-core \
+ && gsd-core --claude --global \
  && which gsd-tools >/dev/null \
- && which gsd-sdk   >/dev/null \
  && npm cache clean --force
 
 # Community hooks gap. The npm package's installer enables two opt-in
@@ -226,9 +225,9 @@ RUN npm install -g @opengsd/get-shit-done-redux \
 # from this repo's community-hooks/ directory into a known build-time
 # location at /opt/empiria/community-hooks/; the vault's post-start.sh
 # copies them into the agent's live ~/.claude/hooks/ after the
-# get-shit-done-redux re-install runs. See agents/scion-template/hooks/
+# gsd-core re-install runs. See agents/scion-template/hooks/
 # post-start.sh in the vault for the deposit step. Surfaced during Phase
-# 33.2 UAT — backlog item to upstream into @opengsd/get-shit-done-redux.
+# 33.2 UAT — backlog item to upstream into @opengsd/gsd-core.
 COPY --chmod=0755 community-hooks/*.sh /opt/empiria/community-hooks/
 
 # Run as root so sciontool init can chown mounted volumes before dropping
