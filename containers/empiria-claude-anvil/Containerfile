@@ -8,6 +8,11 @@ RUN npx playwright install-deps chromium
 # Anvil CLI: schema validation for anvil.yaml and client_code/**/form_template.yaml
 RUN npm install -g @anvil-works/anvil-cli
 
+# Browsers must live outside /home/scion — SCION bind-mounts the agent's
+# host-side home over it at runtime, shadowing anything baked there
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN mkdir -p /opt/ms-playwright && chown scion:scion /opt/ms-playwright
+
 USER scion
 
 # Playwright browser + pytest integration
