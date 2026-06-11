@@ -123,11 +123,14 @@ def test_get_protected_paths_resolves_under_patched_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     from mnemosyne_cli.lib.broker import get_protected_paths
     paths = get_protected_paths()
-    assert len(paths) == 2
+    # One .claude.json + config.yaml pair per managed harness-config
+    # (claude + claude-anvil).
+    assert len(paths) == 4
     assert all(str(p).startswith(str(tmp_path)) for p in paths)
-    # Two specific harness-config files:
     names = sorted(p.name for p in paths)
-    assert names == [".claude.json", "config.yaml"]
+    assert names == [".claude.json", ".claude.json", "config.yaml", "config.yaml"]
+    parents = {p.parent.parts[-2] if p.name == ".claude.json" else p.parent.name for p in paths}
+    assert parents == {"claude", "claude-anvil"}
 
 
 def test_atomic_write_no_orphan_on_failed_replace(tmp_path, monkeypatch):
@@ -153,3 +156,69 @@ def test_atomic_write_no_orphan_on_failed_replace(tmp_path, monkeypatch):
         broker._atomic_write(target2, "will fail")
     orphans_after = list(tmp_path.glob(".mnemosyne-tmp-*"))
     assert orphans_after == [], f"failure path left orphan(s): {orphans_after}"
+
+
+def _seed_vault_template_root(root: Path, with_anvil: bool = True) -> Path:
+    """Build a fake agents/scion-template/ seed root; return the claude seed dir."""
+    claude_seed = root / "claude-harness-config"
+    claude_seed.mkdir(parents=True)
+    (claude_seed / ".claude.json").write_text((FIXTURES / ".claude.json").read_text())
+    (claude_seed / "config.yaml").write_text((FIXTURES / "config.yaml").read_text())
+    if with_anvil:
+        anvil_seed = root / "claude-anvil-harness-config"
+        (anvil_seed / "home" / ".claude").mkdir(parents=True)
+        (anvil_seed / "config.yaml").write_text(
+            "harness: claude\nimage: ghcr.io/empiria/empiria-claude-anvil:latest\nuser: scion\n"
+        )
+        (anvil_seed / "home" / ".bashrc").write_text("# scion agent bashrc\n")
+        (anvil_seed / "home" / ".claude" / "settings.json").write_text('{"hooks": {}}\n')
+    return claude_seed
+
+
+def test_overlay_seeds_claude_anvil_variant(tmp_path, monkeypatch):
+    """With the claude-anvil seed dir present as a sibling, the overlay writes the
+    variant's config.yaml AND inherits .claude.json from the claude seed."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    claude_seed = _seed_vault_template_root(tmp_path / "scion-template")
+
+    from mnemosyne_cli.lib.broker import apply_harness_config_overlay
+
+    result = apply_harness_config_overlay(seed_dir=claude_seed)
+
+    base = fake_home / ".scion" / "harness-configs"
+    anvil_yaml = base / "claude-anvil" / "config.yaml"
+    anvil_json = base / "claude-anvil" / "home" / ".claude.json"
+    assert anvil_yaml.is_file(), f"missing {anvil_yaml}; written={result.written}"
+    assert "empiria-claude-anvil" in anvil_yaml.read_text()
+    assert anvil_json.is_file(), f"missing {anvil_json}; written={result.written}"
+    assert anvil_json.read_text() == (claude_seed / ".claude.json").read_text(), \
+        "variant .claude.json must inherit the claude seed's copy"
+    # home/ tree (bashrc + lifecycle-hook settings) deployed alongside
+    assert (base / "claude-anvil" / "home" / ".bashrc").is_file()
+    assert (base / "claude-anvil" / "home" / ".claude" / "settings.json").is_file()
+    assert (base / "claude" / "config.yaml").is_file()
+    assert len(result.written) == 6
+
+    # Idempotent: second run writes nothing.
+    second = apply_harness_config_overlay(seed_dir=claude_seed)
+    assert not second.written, f"expected idempotent no-op; wrote {second.written}"
+
+
+def test_overlay_skips_anvil_when_variant_seed_absent(tmp_path, monkeypatch):
+    """Older vault checkouts without the claude-anvil seed must not break the
+    overlay — claude is seeded, the variant is silently skipped."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    claude_seed = _seed_vault_template_root(tmp_path / "scion-template", with_anvil=False)
+
+    from mnemosyne_cli.lib.broker import apply_harness_config_overlay
+
+    result = apply_harness_config_overlay(seed_dir=claude_seed)
+
+    base = fake_home / ".scion" / "harness-configs"
+    assert (base / "claude" / "config.yaml").is_file()
+    assert not (base / "claude-anvil").exists()
+    assert len(result.written) == 2

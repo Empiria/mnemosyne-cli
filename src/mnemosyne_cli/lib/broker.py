@@ -281,15 +281,26 @@ EXPECTED_AUTH_SELECTED_TYPE = "oauth-token"
 EXPECTED_GROVE_TEMPLATE = "empiria-agent"
 EXPECTED_GROVE_HARNESS = "claude"
 
+# Harness-config name -> vault seed dir (under agents/scion-template/).
+# claude is REQUIRED (missing seed dir raises); variants are best-effort so a
+# broker running against an older vault checkout still starts. Variants
+# without their own .claude.json inherit the claude seed's copy — single
+# source of truth for the onboarding acknowledgements.
+HARNESS_CONFIG_SEED_DIRS: dict[str, str] = {
+    "claude": "claude-harness-config",
+    "claude-anvil": "claude-anvil-harness-config",
+}
+
 
 def get_protected_paths() -> list[Path]:
-    """Return the two harness-config paths the chattr lock guards.
+    """Return the harness-config paths the chattr lock guards (one .claude.json
+    + config.yaml pair per managed harness-config).
 
     LAZY — re-evaluates at every call so tests that monkeypatch Path.home()
     AFTER import time see the patched home. Per Plan 03 Task 03.2 fix
     (planning revision): a module-level ``PROTECTED_PATHS = [...]`` would
     resolve against the real host at import time and break monkeypatched
-    tests. The two scion_paths helpers themselves call Path.home() at call
+    tests. The scion_paths helpers themselves call Path.home() at call
     time, so this function is idempotent and safe to call repeatedly.
     """
     from mnemosyne_cli.lib.scion_paths import (
@@ -297,10 +308,11 @@ def get_protected_paths() -> list[Path]:
         harness_config_yaml,
     )
 
-    return [
-        harness_config_claude_json(),
-        harness_config_yaml(),
-    ]
+    paths: list[Path] = []
+    for name in HARNESS_CONFIG_SEED_DIRS:
+        paths.append(harness_config_claude_json(name))
+        paths.append(harness_config_yaml(name))
+    return paths
 
 
 @dataclass
@@ -381,24 +393,29 @@ def _atomic_write(path: Path, content: bytes | str) -> None:
 
 
 def _default_seed_dir() -> Path:
-    """Locate the canonical harness-config seed dir in the vault."""
+    """Locate the canonical claude harness-config seed dir in the vault."""
     from mnemosyne_cli.lib import vault
 
     vault_path = vault.resolve_vault_path()
-    return vault_path / "agents" / "scion-template" / "claude-harness-config"
+    return vault_path / "agents" / "scion-template" / HARNESS_CONFIG_SEED_DIRS["claude"]
 
 
 def apply_harness_config_overlay(seed_dir: Path | None = None) -> OverlayResult:
-    """Write canonical .claude.json + config.yaml to ~/.scion/harness-configs/claude/.
+    """Write canonical .claude.json + config.yaml to each managed
+    ~/.scion/harness-configs/<name>/ dir (claude, claude-anvil, ...).
 
     Idempotent. Toggles chattr -i / +i around writes via get_protected_paths()
     (LAZY — resolved at this call, not at module import). Uses atomic
     temp+replace for crash safety.
 
-    Raises FileNotFoundError if seed_dir does not exist.
+    seed_dir overrides the claude seed location; variant seeds are resolved as
+    siblings of it. Raises FileNotFoundError if the claude seed_dir does not
+    exist; a missing variant seed dir is skipped (older vault checkouts must
+    not break broker start).
     """
     from mnemosyne_cli.lib.scion_paths import (
         harness_config_claude_json,
+        harness_config_dir,
         harness_config_yaml,
     )
 
@@ -413,6 +430,33 @@ def apply_harness_config_overlay(seed_dir: Path | None = None) -> OverlayResult:
         (seed_dir / ".claude.json", harness_config_claude_json()),
         (seed_dir / "config.yaml", harness_config_yaml()),
     ]
+    for name, seed_dirname in HARNESS_CONFIG_SEED_DIRS.items():
+        if name == "claude":
+            continue
+        variant_seed = seed_dir.parent / seed_dirname
+        if not variant_seed.is_dir():
+            continue
+        # Variant seeds without their own .claude.json inherit the claude
+        # seed's copy (single source of truth for onboarding acknowledgements).
+        variant_json = variant_seed / ".claude.json"
+        if not variant_json.is_file():
+            variant_json = seed_dir / ".claude.json"
+        pairs.append((variant_json, harness_config_claude_json(name)))
+        pairs.append((variant_seed / "config.yaml", harness_config_yaml(name)))
+        # Variants also ship a home/ tree (.bashrc, .claude/settings.json with
+        # the sciontool lifecycle hooks). The broker's embedded seeding only
+        # populates home/ for built-in harness names, so for custom-named dirs
+        # the overlay is the only writer.
+        variant_home = variant_seed / "home"
+        if variant_home.is_dir():
+            target_home = harness_config_dir(name) / "home"
+            for seed_file in sorted(variant_home.rglob("*")):
+                if not seed_file.is_file():
+                    continue
+                rel = seed_file.relative_to(variant_home)
+                if rel == Path(".claude.json"):
+                    continue  # already handled (with claude-seed inheritance)
+                pairs.append((seed_file, target_home / rel))
 
     with writable(get_protected_paths()):
         for seed_path, target_path in pairs:
@@ -472,24 +516,27 @@ def compute_canonical_changes() -> list[CanonicalChange]:
             user_data = None
 
     if user_path.exists() and user_data is not None:
-        current_auth = (
-            (user_data.get("harness_configs") or {})
-            .get("claude", {})
+        drifted_names = [
+            name
+            for name in HARNESS_CONFIG_SEED_DIRS
+            if (user_data.get("harness_configs") or {})
+            .get(name, {})
             .get("auth_selected_type")
-        )
-        auth_drift = current_auth != EXPECTED_AUTH_SELECTED_TYPE
+            != EXPECTED_AUTH_SELECTED_TYPE
+        ]
 
         new_profiles, profile_drift = _strip_profile_vault_overrides(
             dict(user_data.get("profiles") or {})
         )
 
-        if auth_drift or profile_drift:
+        if drifted_names or profile_drift:
             target_data = dict(user_data)
-            if auth_drift:
+            if drifted_names:
                 hc = dict(target_data.get("harness_configs") or {})
-                claude_hc = dict(hc.get("claude") or {})
-                claude_hc["auth_selected_type"] = EXPECTED_AUTH_SELECTED_TYPE
-                hc["claude"] = claude_hc
+                for name in drifted_names:
+                    name_hc = dict(hc.get(name) or {})
+                    name_hc["auth_selected_type"] = EXPECTED_AUTH_SELECTED_TYPE
+                    hc[name] = name_hc
                 target_data["harness_configs"] = hc
             if profile_drift:
                 target_data["profiles"] = new_profiles

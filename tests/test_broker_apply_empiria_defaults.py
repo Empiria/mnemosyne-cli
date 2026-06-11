@@ -36,7 +36,11 @@ def _seed_grove(home: Path, name: str, source: Path) -> Path:
 
 
 def test_apply_empiria_defaults_writes_oauth_token_on_drifted_user_settings(tmp_path, monkeypatch):
-    """User ~/.scion/settings.yaml with auth-file drift converges to oauth-token."""
+    """User ~/.scion/settings.yaml with auth-file drift converges to oauth-token.
+
+    The claude-anvil block (absent in the drifted fixture) is created with the
+    canonical auth type too — every managed harness-config converges.
+    """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     user_settings = _seed_user_settings(fake_home, FIXTURES_SETTINGS / "drifted_auth.yaml")
@@ -47,6 +51,7 @@ def test_apply_empiria_defaults_writes_oauth_token_on_drifted_user_settings(tmp_
 
     data = yaml.safe_load(user_settings.read_text()) or {}
     assert data["harness_configs"]["claude"]["auth_selected_type"] == "oauth-token"
+    assert data["harness_configs"]["claude-anvil"]["auth_selected_type"] == "oauth-token"
 
 
 def test_apply_empiria_defaults_writes_canonical_grove_settings(tmp_path, monkeypatch):

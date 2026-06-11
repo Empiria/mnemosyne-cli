@@ -35,16 +35,16 @@ def user_settings_path() -> Path:
     return Path.home() / ".scion" / "settings.yaml"
 
 
-def harness_config_dir() -> Path:
-    return Path.home() / ".scion" / "harness-configs" / "claude"
+def harness_config_dir(name: str = "claude") -> Path:
+    return Path.home() / ".scion" / "harness-configs" / name
 
 
-def harness_config_claude_json() -> Path:
-    return harness_config_dir() / "home" / ".claude.json"
+def harness_config_claude_json(name: str = "claude") -> Path:
+    return harness_config_dir(name) / "home" / ".claude.json"
 
 
-def harness_config_yaml() -> Path:
-    return harness_config_dir() / "config.yaml"
+def harness_config_yaml(name: str = "claude") -> Path:
+    return harness_config_dir(name) / "config.yaml"
 
 
 def iter_grove_settings_paths(
