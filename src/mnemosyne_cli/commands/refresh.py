@@ -1,4 +1,4 @@
-"""mnemosyne refresh — update the qmd index and regenerate learning manifests."""
+"""mnemosyne refresh — pull agent images, update the qmd index, regenerate learning manifests."""
 
 from __future__ import annotations
 
@@ -11,16 +11,44 @@ from rich.console import Console
 from mnemosyne_cli.lib import vault
 from mnemosyne_cli.lib.manifests import generate_learning_manifest
 
+# SCION agent images every Empiria broker host runs. podman never re-pulls
+# :latest on its own, so refresh is what keeps these current — a stale pull
+# surfaces as agent bootstrap failures at dispatch time.
+SCION_IMAGES = [
+    "ghcr.io/empiria/empiria-claude:latest",
+    "ghcr.io/empiria/empiria-claude-anvil:latest",
+]
+
 console = Console()
 error_console = Console(stderr=True, style="bold red")
 
 
 def run(
+    skip_images: bool = typer.Option(False, "--skip-images", help="Skip agent image pull."),
     skip_qmd: bool = typer.Option(False, "--skip-qmd", help="Skip qmd index update."),
 ) -> None:
-    """Refresh the qmd search index and regenerate learning manifests."""
+    """Pull SCION agent images, refresh the qmd search index, regenerate learning manifests."""
     vault_path = vault.resolve_vault_path()
     failed = False
+
+    # --- SCION agent images ---
+    if not skip_images:
+        console.rule("[bold cyan]Pulling agent images[/bold cyan]")
+
+        if not shutil.which("podman"):
+            console.print("  [dim]podman not found on PATH — skipping image pull.[/dim]")
+        else:
+            for registry_ref in SCION_IMAGES:
+                console.print(f"  Pulling [cyan]{registry_ref}[/cyan]...")
+                result = subprocess.run(["podman", "pull", registry_ref], text=True)
+                if result.returncode != 0:
+                    error_console.print(f"  [red]Failed[/red] to pull {registry_ref}")
+                    error_console.print("  Hint: if you see 403, run: podman login ghcr.io")
+                    failed = True
+                else:
+                    console.print(f"  [green]Pulled[/green] {registry_ref}")
+    else:
+        console.print("[dim]Skipping image pull.[/dim]")
 
     # --- qmd index ---
     if not skip_qmd:
