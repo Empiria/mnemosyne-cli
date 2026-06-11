@@ -17,6 +17,7 @@ from mnemosyne_cli.lib import git as lib_git
 from mnemosyne_cli.lib import overrides as lib_overrides
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
+from mnemosyne_cli.lib import vault_worktree as lib_worktree
 from mnemosyne_cli.lib.checks import run_container_checks
 from mnemosyne_cli.lib.setup import setup_claude_overlay, setup_worktree_symlinks
 from mnemosyne_cli.lib.skills import discover_vault_skills
@@ -131,9 +132,38 @@ def _run_container(project: str | None, target: Path | None) -> None:
     console.print(f"  vault:   {vault_path}")
     console.print(f"  project: {project}")
 
+    # --- Vault agent worktree (branch isolation) ---
+    # Agents must never run git against the vault main checkout — it is the
+    # host operator's live working tree, bind-mounted into every container.
+    # Project content (.planning, AGENTS.md, settings) is wired through a
+    # project-scoped vault worktree instead; falls back to the main checkout
+    # (pre-worktree behaviour) when the vault is not a git repo or worktree
+    # creation fails — bootstrap must not die on this.
+    project_source = vault_project_path
+    try:
+        wt = lib_worktree.ensure_vault_worktree(vault_path, project)
+        wt_project = wt / project
+        if wt_project.is_dir():
+            project_source = wt_project
+            branch = lib_worktree.worktree_branch(lib_worktree.project_slug(project))
+            console.print(
+                f"  [green]Vault worktree[/green] {wt} (branch {branch})"
+            )
+        else:
+            error_console.print(
+                f"  [yellow]Warning[/yellow] project missing from vault worktree "
+                f"({wt_project}) — wiring to main checkout. Merge the worktree "
+                f"branch and remove the worktree to refresh it."
+            )
+    except Exception as exc:
+        error_console.print(
+            f"  [yellow]Warning[/yellow] vault worktree unavailable ({exc}) — "
+            "wiring to main checkout"
+        )
+
     # --- Symlinks (shared path with host init) ---
     try:
-        setup_worktree_symlinks(target, vault_path, vault_project_path)
+        setup_worktree_symlinks(target, vault_path, project_source)
         console.print("  [green]Wired[/green] .planning, AGENTS.md, CLAUDE.md, .claude/*")
     except Exception as exc:
         error_console.print(f"  [red]Error[/red] symlink setup: {exc}")

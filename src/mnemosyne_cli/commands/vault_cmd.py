@@ -242,3 +242,123 @@ def rule(
     _write_config(data)
 
     console.print(action_msg)
+
+
+# ---------------------------------------------------------------------------
+# agent worktrees (host-side management)
+# ---------------------------------------------------------------------------
+
+
+@app.command("worktrees")
+def worktrees() -> None:
+    """List vault agent worktrees and their merge status (host-side)."""
+    from mnemosyne_cli.lib import vault as lib_vault
+    from mnemosyne_cli.lib import vault_worktree as lib_worktree
+
+    vault_path = lib_vault.resolve_vault_path()
+    entries = lib_worktree.list_agent_worktrees(vault_path)
+    if not entries:
+        console.print("No vault agent worktrees.")
+        return
+
+    table = Table()
+    table.add_column("Slug", style="bold")
+    table.add_column("Branch")
+    table.add_column("Unmerged")
+    table.add_column("Dirty")
+    for wt in entries:
+        path = Path(wt["worktree"])
+        branch = wt.get("branch", "(detached)")
+        unmerged = lib_worktree.unmerged_commit_count(vault_path, branch)
+        dirty = lib_worktree.is_worktree_dirty(path)
+        table.add_row(
+            path.name,
+            branch,
+            str(unmerged) if unmerged else "-",
+            "yes" if dirty else "-",
+        )
+    console.print(table)
+    console.print(
+        "Merge with [bold]mnemosyne vault merge <slug>[/bold]; "
+        "dirty worktrees need their changes committed (or discarded) first."
+    )
+
+
+@app.command("merge")
+def merge(
+    slug: Annotated[str, typer.Argument(help="Worktree slug (directory name under <vault>/worktrees/)")],
+    keep: Annotated[bool, typer.Option("--keep", help="Keep the worktree and branch after merging")] = False,
+) -> None:
+    """Merge a vault agent worktree's branch into the current vault branch (host-side).
+
+    On a clean merge the worktree and branch are removed (unless --keep), so
+    the next agent run recreates them fresh from HEAD. On conflict the merge
+    is left for manual resolution and the worktree is kept.
+    """
+    from mnemosyne_cli.lib import vault as lib_vault
+    from mnemosyne_cli.lib import vault_worktree as lib_worktree
+
+    vault_path = lib_vault.resolve_vault_path()
+    wt_path = lib_worktree.worktree_path(vault_path, slug)
+    branch = lib_worktree.worktree_branch(slug)
+
+    lib_worktree.repair_worktrees(vault_path)
+
+    registered = {
+        Path(wt["worktree"]).resolve()
+        for wt in lib_worktree.list_agent_worktrees(vault_path)
+    }
+    if wt_path.resolve() not in registered:
+        error_console.print(f"No registered agent worktree at {wt_path}")
+        raise typer.Exit(1)
+
+    if lib_worktree.is_worktree_dirty(wt_path):
+        error_console.print(
+            f"Worktree {wt_path} has uncommitted changes — commit them there "
+            f"(git -C {wt_path} add -A && git -C {wt_path} commit) and re-run."
+        )
+        raise typer.Exit(1)
+
+    unmerged = lib_worktree.unmerged_commit_count(vault_path, branch)
+    if unmerged:
+        console.print(f"Merging {unmerged} commit(s) from [bold]{branch}[/bold]...")
+        result = subprocess.run(
+            ["git", "-C", str(vault_path), "merge", "--no-edit", branch],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            error_console.print(
+                f"Merge failed — resolve manually in {vault_path}:\n"
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            raise typer.Exit(1)
+        console.print(f"[green]Merged[/green] {branch}")
+    else:
+        console.print(f"Nothing to merge from {branch}.")
+
+    if keep:
+        console.print("Worktree kept (--keep).")
+        return
+
+    remove_wt = subprocess.run(
+        ["git", "-C", str(vault_path), "worktree", "remove", str(wt_path)],
+        capture_output=True,
+        text=True,
+    )
+    if remove_wt.returncode != 0:
+        error_console.print(
+            f"Could not remove worktree: {remove_wt.stderr.strip()}"
+        )
+        raise typer.Exit(1)
+    delete_branch = subprocess.run(
+        ["git", "-C", str(vault_path), "branch", "-d", branch],
+        capture_output=True,
+        text=True,
+    )
+    if delete_branch.returncode != 0:
+        error_console.print(
+            f"Worktree removed but branch not deleted: {delete_branch.stderr.strip()}"
+        )
+        raise typer.Exit(1)
+    console.print(f"[green]Removed[/green] worktree and branch {branch} — next agent run recreates them from HEAD.")

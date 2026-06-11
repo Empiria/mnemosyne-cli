@@ -98,11 +98,16 @@ def check_workspace_planning(target: Path, vault_path: Path) -> CheckResult:
             message=f"{planning} symlink target unresolvable: {exc}",
             fix_cmd="mnemosyne init --container",
         )
+    # Wired either to the main checkout (vault/projects/...) or to a vault
+    # agent worktree (vault/worktrees/<slug>/projects/...).
     projects_root = (vault_path / "projects").resolve()
-    if projects_root not in resolved.parents:
+    worktrees_root = (vault_path / "worktrees").resolve()
+    in_main = projects_root in resolved.parents
+    in_worktree = worktrees_root in resolved.parents and "projects" in resolved.parts
+    if not (in_main or in_worktree):
         return CheckResult(
             ok=False,
-            message=f"{planning} resolves outside vault/projects/: {resolved}",
+            message=f"{planning} resolves outside vault projects: {resolved}",
             fix_cmd=None,
         )
     return CheckResult(ok=True, message=f"{planning} -> {resolved}")
