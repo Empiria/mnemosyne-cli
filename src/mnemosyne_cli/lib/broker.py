@@ -281,6 +281,16 @@ EXPECTED_AUTH_SELECTED_TYPE = "oauth-token"
 EXPECTED_GROVE_TEMPLATE = "empiria-agent"
 EXPECTED_GROVE_HARNESS = "claude"
 
+# Recognised Empiria template variants and the harness-config each pairs with.
+# Grove convergence preserves a deliberate variant choice (e.g. an Anvil
+# project on empiria-agent-anvil) instead of flattening every grove to the
+# claude defaults — it only enforces that template and harness-config stay a
+# matched pair. Groves on unrecognised templates converge to the defaults.
+CANONICAL_GROVE_PAIRS: dict[str, str] = {
+    EXPECTED_GROVE_TEMPLATE: EXPECTED_GROVE_HARNESS,
+    "empiria-agent-anvil": "claude-anvil",
+}
+
 # Harness-config name -> vault seed dir (under agents/scion-template/).
 # claude is REQUIRED (missing seed dir raises); variants are best-effort so a
 # broker running against an older vault checkout still starts. Variants
@@ -548,6 +558,9 @@ def compute_canonical_changes() -> list[CanonicalChange]:
 
     # (b) Per-grove settings.yaml — field-level merge (only the two Empiria-managed
     # keys are changed; all other operator-configured keys are preserved).
+    # A grove on a recognised template variant keeps it; convergence only
+    # repairs the paired harness-config. Unrecognised templates converge to
+    # the empiria-agent/claude defaults.
     for grove_path in iter_grove_settings_paths():
         try:
             grove_data = yaml_safe_load_or_none(grove_path) or {}
@@ -556,13 +569,20 @@ def compute_canonical_changes() -> list[CanonicalChange]:
             # blank-target dict would overwrite (destroy) operator content
             # we could not parse, the same data-loss class as CR-01.
             continue
+        grove_template = grove_data.get("default_template")
+        expected_template = (
+            grove_template
+            if grove_template in CANONICAL_GROVE_PAIRS
+            else EXPECTED_GROVE_TEMPLATE
+        )
+        expected_harness = CANONICAL_GROVE_PAIRS[expected_template]
         if (
-            grove_data.get("default_template") != EXPECTED_GROVE_TEMPLATE
-            or grove_data.get("default_harness_config") != EXPECTED_GROVE_HARNESS
+            grove_data.get("default_template") != expected_template
+            or grove_data.get("default_harness_config") != expected_harness
         ):
             target = dict(grove_data)
-            target["default_template"] = EXPECTED_GROVE_TEMPLATE
-            target["default_harness_config"] = EXPECTED_GROVE_HARNESS
+            target["default_template"] = expected_template
+            target["default_harness_config"] = expected_harness
             changes.append(
                 CanonicalChange(
                     path=grove_path, current=grove_data, target=target

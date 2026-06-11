@@ -178,3 +178,40 @@ def test_grove_convergence_preserves_extra_keys(tmp_path, monkeypatch):
     assert data["profiles"]["fast"]["model"] == "claude-3-5-haiku-20241022"
     assert data["profiles"]["thorough"]["model"] == "claude-opus-4-5"
     assert data.get("custom_field") == "operator-configured-value", f"custom_field lost: {data}"
+
+
+def test_grove_convergence_preserves_anvil_variant(tmp_path, monkeypatch):
+    """A grove deliberately on empiria-agent-anvil/claude-anvil is canonical —
+    convergence must NOT flatten it back to empiria-agent/claude."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _seed_user_settings(fake_home, FIXTURES_SETTINGS / "canonical.yaml")
+    anvil_grove = _seed_grove(
+        fake_home, "infinite-worlds__abc", FIXTURES_GROVE / "empiria_anvil.yaml"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    from mnemosyne_cli.lib.broker import apply_empiria_defaults
+    apply_empiria_defaults()
+
+    data = yaml.safe_load(anvil_grove.read_text()) or {}
+    assert data["default_template"] == "empiria-agent-anvil", data
+    assert data["default_harness_config"] == "claude-anvil", data
+
+
+def test_grove_convergence_repairs_mismatched_anvil_pair(tmp_path, monkeypatch):
+    """An anvil-template grove with the wrong harness-config gets the PAIRED
+    harness (claude-anvil), not the global claude default."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _seed_user_settings(fake_home, FIXTURES_SETTINGS / "canonical.yaml")
+    grove = _seed_grove(fake_home, "infinite-worlds__abc", FIXTURES_GROVE / "empiria.yaml")
+    grove.write_text("default_template: empiria-agent-anvil\ndefault_harness_config: claude\n")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    from mnemosyne_cli.lib.broker import apply_empiria_defaults
+    apply_empiria_defaults()
+
+    data = yaml.safe_load(grove.read_text()) or {}
+    assert data["default_template"] == "empiria-agent-anvil", data
+    assert data["default_harness_config"] == "claude-anvil", data
