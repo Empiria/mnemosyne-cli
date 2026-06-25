@@ -5,8 +5,10 @@ USER root
 # Playwright system dependencies for browser testing
 RUN npx playwright install-deps chromium
 
-# Anvil CLI: schema validation for anvil.yaml and client_code/**/form_template.yaml
-RUN npm install -g @anvil-works/anvil-cli
+# Anvil CLI: schema validation (anvil.yaml, client_code/**/*.{yaml,html,py},
+# server_code/**/*.py — file or directory) plus convert-template (YAML form -> HTML).
+# Pinned for reproducible builds; bump deliberately and rebuild the image.
+RUN npm install -g @anvil-works/anvil-cli@0.7.1
 
 # Browsers must live outside /home/scion — SCION bind-mounts the agent's
 # host-side home over it at runtime, shadowing anything baked there
