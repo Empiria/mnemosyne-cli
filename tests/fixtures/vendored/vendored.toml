@@ -1,0 +1,13 @@
+[[vendored]]
+name = "anvil-agent-references"
+upstream = "https://github.com/anvil-works/anvil-agent-references"
+path = "agents/vendored/anvil-agent-references"
+ref = "abc1234abc1234abc1234abc1234abc1234abc1234"
+upstream_owned = ["skills", "stubs", "reference"]
+
+[[vendored]]
+name = "obsidian-skills"
+upstream = "https://github.com/obsidianmd/obsidian-skills"
+path = "agents/vendored/obsidian-skills"
+ref = "be978124be978124be978124be978124be978124"
+upstream_owned = ["skills"]
