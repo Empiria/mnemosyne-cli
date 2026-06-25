@@ -75,3 +75,94 @@ def test_discover_returns_empty_for_missing_agents_skills_dir(tmp_path):
     empty_vault = tmp_path / "empty_vault"
     empty_vault.mkdir()
     assert discover_vault_skills(empty_vault) == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 54 Plan 03 — Vendored skills regression (Pitfall 3)
+#
+# After obsidian-skills moves from agents/skills/obsidian-skills/ to
+# agents/vendored/obsidian-skills/ (D-13), and after anvil-agent-references
+# lands at agents/vendored/anvil-agent-references/, discover_vault_skills must
+# find skills in BOTH vendored subtrees.
+#
+# These tests are RED until Plan 54-05 extends the discover_vault_skills walk
+# to include agents/vendored/ as a second root.
+# ---------------------------------------------------------------------------
+
+
+def test_discover_finds_vendored_obsidian_skills(tmp_path):
+    """Skills under agents/vendored/obsidian-skills/skills/ are discovered (Pitfall 3 regression).
+
+    After the D-13 submodule retirement, obsidian-skills moves from
+    agents/skills/obsidian-skills/ to agents/vendored/obsidian-skills/.
+    discover_vault_skills must still find the nested skills inside it.
+    """
+    from mnemosyne_cli.lib.skills import discover_vault_skills  # lazy import
+
+    # Seed agents/vendored/obsidian-skills/skills/foo/SKILL.md
+    skill_dir = tmp_path / "agents" / "vendored" / "obsidian-skills" / "skills" / "foo"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text("# foo skill from obsidian-skills\n")
+
+    skills = discover_vault_skills(tmp_path)
+    names = {n for n, _ in skills}
+    assert "foo" in names, (
+        f"discover_vault_skills must find 'foo' from agents/vendored/obsidian-skills/skills/; "
+        f"got: {names}"
+    )
+
+
+def test_discover_finds_vendored_anvil_agent_references_skills(tmp_path):
+    """Skills under agents/vendored/anvil-agent-references/skills/ are discovered (Pitfall 3 regression).
+
+    After vendoring, agents/vendored/anvil-agent-references/skills/* must be
+    picked up by discover_vault_skills so they surface under ~/.claude/skills/*.
+    """
+    from mnemosyne_cli.lib.skills import discover_vault_skills  # lazy import
+
+    # Seed agents/vendored/anvil-agent-references/skills/form-code/SKILL.md
+    skill_dir = (
+        tmp_path / "agents" / "vendored" / "anvil-agent-references" / "skills" / "form-code"
+    )
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text("# form-code skill from anvil-agent-references\n")
+
+    skills = discover_vault_skills(tmp_path)
+    names = {n for n, _ in skills}
+    assert "form-code" in names, (
+        f"discover_vault_skills must find 'form-code' from "
+        f"agents/vendored/anvil-agent-references/skills/; got: {names}"
+    )
+
+
+def test_discover_finds_both_vendored_skill_sets(tmp_path):
+    """Both obsidian-skills and anvil-agent-references vendored skills appear (Pitfall 3).
+
+    This is the critical regression test: both vendored skill namespaces must be
+    discovered simultaneously, confirming that the extended walk covers BOTH entries
+    under agents/vendored/ in a single discover_vault_skills(vault_path) call.
+    """
+    from mnemosyne_cli.lib.skills import discover_vault_skills  # lazy import
+
+    # Seed agents/vendored/obsidian-skills/skills/defuddle/SKILL.md
+    obsidian_skill = (
+        tmp_path / "agents" / "vendored" / "obsidian-skills" / "skills" / "defuddle"
+    )
+    obsidian_skill.mkdir(parents=True, exist_ok=True)
+    (obsidian_skill / "SKILL.md").write_text("# defuddle skill\n")
+
+    # Seed agents/vendored/anvil-agent-references/skills/form-code/SKILL.md
+    anvil_skill = (
+        tmp_path / "agents" / "vendored" / "anvil-agent-references" / "skills" / "form-code"
+    )
+    anvil_skill.mkdir(parents=True, exist_ok=True)
+    (anvil_skill / "SKILL.md").write_text("# form-code skill\n")
+
+    skills = discover_vault_skills(tmp_path)
+    names = {n for n, _ in skills}
+    assert "defuddle" in names, (
+        f"discover_vault_skills must find 'defuddle' from obsidian-skills; got: {names}"
+    )
+    assert "form-code" in names, (
+        f"discover_vault_skills must find 'form-code' from anvil-agent-references; got: {names}"
+    )
