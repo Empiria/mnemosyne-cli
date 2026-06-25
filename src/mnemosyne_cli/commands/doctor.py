@@ -35,6 +35,7 @@ from mnemosyne_cli.lib.symlinks import (
     remove_skill_symlink,
 )
 from mnemosyne_cli.lib.techstack import discover_tech_rules, parse_tech_stack
+from mnemosyne_cli.lib import vendoring as lib_vendoring
 from mnemosyne_cli.share.manifest import load_manifest, ManifestError
 from mnemosyne_cli.share.walker import walk_manifest, AmbiguousLinkError, WalkResult
 
@@ -1453,6 +1454,24 @@ def _build_checks(
             )
         )
 
+    # --- Category: Vendored Drift (D-07, Phase 54) ---
+    # Host-side only, read-only (no _fix_fn). Informs the operator that vendored
+    # copies may be out of date. Returns ok=True always (warn, not hard fail) so
+    # the default doctor exit code is unaffected. Use --vendored-drift for CI.
+    if not container:
+        def _make_vendored_drift_check(vp: Path) -> Callable[[], CheckResult]:
+            def _check() -> CheckResult:
+                return _check_vendored_drift(vp)
+            return _check
+
+        checks.append(
+            Check(
+                name="vendored copy freshness",
+                category="Vendored Drift",
+                _check_fn=_make_vendored_drift_check(vault_path),
+            )
+        )
+
     # --- Category: Operational Home (D-E1/E2/E3) ---
     # Config-global checks (vault registration, path existence, script presence)
     # run ALWAYS — no cwd dependency (like Merge Drivers, Vault Consistency).
@@ -2050,6 +2069,63 @@ def _run_share_manifests(vault_path: Path, json_out: bool) -> bool:
     return should_fail
 
 
+def _check_vendored_drift(vault_path: Path) -> CheckResult:
+    """Check for vendored copy drift — informational only (D-07 warn path).
+
+    Default doctor run: always returns ok=True so it does not flip the exit code.
+    The message names drifted entries when drift is detected (printed as a warning).
+    The check is read-only — no _fix_fn; a fix_cmd string points the operator at
+    ``mnemosyne refresh <name>`` (the reconciled D-05 named selector).
+
+    Module-level for testability; consumed by the Vendored Drift category in
+    `_build_checks`. Use ``mnemosyne doctor --vendored-drift`` for the CI exit-
+    nonzero path.
+    """
+    entries = lib_vendoring.load_manifest(vault_path)
+    if not entries:
+        return CheckResult(ok=True, message="No vendored.toml found — nothing to check")
+
+    entry_names = ", ".join(e["name"] for e in entries)
+    return CheckResult(
+        ok=True,
+        message=(
+            f"Vendored entries present: {entry_names}. "
+            f"Run 'mnemosyne doctor --vendored-drift' to check for upstream drift."
+        ),
+        fix_cmd="mnemosyne refresh <name>",
+    )
+
+
+def _run_vendored_drift(vault_path: Path) -> bool:
+    """Walk all vendored entries and detect drift using local .upstream-shas sidecar.
+
+    Uses :func:`vendoring.diff_local` for network-free drift detection — compares
+    committed copy files against the sha256 manifest written by ``mnemosyne refresh``.
+    Returns True iff the run should exit non-zero (drift detected for any entry).
+
+    Module-level (not a _check_fn) so tests can call it directly. Mirrors the
+    ``_run_share_manifests`` shape (doctor.py analogue for --share-manifests).
+    """
+    drifted = lib_vendoring.diff_local(vault_path)
+
+    if drifted:
+        console.print(
+            f"[yellow]Vendored drift detected:[/yellow] "
+            f"{len(drifted)} file(s) differ from last refresh."
+        )
+        for path in drifted[:10]:
+            console.print(f"  [dim]{path}[/dim]")
+        if len(drifted) > 10:
+            console.print(f"  [dim]… and {len(drifted) - 10} more[/dim]")
+        console.print("  Fix: mnemosyne refresh <name>")
+        return True
+
+    entries = lib_vendoring.load_manifest(vault_path)
+    entry_names = ", ".join(e["name"] for e in entries)
+    console.print(f"[green]Vendored copies in sync[/green]: {entry_names}")
+    return False
+
+
 def run(
     fix: bool = typer.Option(False, "--fix", help="Apply fixes with per-fix confirmation"),
     container: bool = typer.Option(
@@ -2067,6 +2143,14 @@ def run(
         "--json",
         help="Emit structured JSON output (for use with --share-manifests, D-16)",
     ),
+    vendored_drift: bool = typer.Option(
+        False,
+        "--vendored-drift",
+        help=(
+            "Check all vendored copies for upstream drift and exit non-zero if any differ "
+            "(CI path, D-07). Default doctor run prints drift without failing."
+        ),
+    ),
 ) -> None:
     """Validate project setup and report issues."""
     # Normalise typer sentinels for programmatic callers (tests invoke run()
@@ -2080,6 +2164,8 @@ def run(
         share_manifests = False
     if isinstance(json_out, typer.models.OptionInfo):
         json_out = False
+    if isinstance(vendored_drift, typer.models.OptionInfo):
+        vendored_drift = False
 
     cwd = Path.cwd()
 
@@ -2091,6 +2177,15 @@ def run(
     # returns before the normal doctor check path — no interaction with --fix.
     if share_manifests:
         should_exit_nonzero = _run_share_manifests(vault_path, json_out=json_out)
+        if should_exit_nonzero:
+            raise typer.Exit(1)
+        return
+
+    # --vendored-drift: check all vendored copies for upstream drift (D-07 CI path).
+    # Mirrors --share-manifests: runs before normal checks and short-circuits.
+    # Default doctor run registers _check_vendored_drift as ok=True (informational).
+    if vendored_drift:
+        should_exit_nonzero = _run_vendored_drift(vault_path)
         if should_exit_nonzero:
             raise typer.Exit(1)
         return

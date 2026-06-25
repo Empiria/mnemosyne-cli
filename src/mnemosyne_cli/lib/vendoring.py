@@ -36,7 +36,13 @@ from pathlib import Path
 # Empiria-owned files — never overwritten by upstream sync, never drift-diffed
 # ---------------------------------------------------------------------------
 
-_EMPIRIA_FILES: set[str] = {"index.md", ".upstream-ref"}
+# Files are identified by FILENAME (not full path) so they are skipped at any
+# nesting depth within an upstream_owned subpath tree.
+_EMPIRIA_FILES: set[str] = {"index.md", ".upstream-ref", ".upstream-shas"}
+
+# Name of the local sha256 sidecar written by refresh_entry into each
+# upstream_owned subpath.  Used by diff_local for network-free drift detection.
+_SHAS_FILENAME = ".upstream-shas"
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +134,13 @@ def refresh_entry(entry: dict, vault_path: Path) -> str:
                 if dst.exists():
                     shutil.rmtree(dst)
                 shutil.copytree(src, dst)
+                # Step 4a: write .upstream-shas sidecar inside the synced dir
+                # so diff_local can detect drift without a network clone.
+                shas = _walk_files(dst, skip=_EMPIRIA_FILES)
+                shas_lines = "".join(
+                    f"{sha}  {rel}\n" for rel, sha in sorted(shas.items())
+                )
+                (dst / _SHAS_FILENAME).write_text(shas_lines)
             elif src.is_file():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
@@ -186,9 +199,10 @@ def _sha256_of_file(path: Path) -> str:
 def _walk_files(root: Path, *, skip: set[str] | None = None) -> dict[str, str]:
     """Walk *root* recursively, returning ``{relative_path_str: sha256_hex}``.
 
-    Skips file names listed in *skip* (basename only, matched against the full
-    relative posix path — e.g. ``"index.md"`` skips any file whose relative
-    path equals ``"index.md"`` at the root level).
+    Skips files whose FILENAME (``path.name``) is listed in *skip*, matching at
+    any nesting depth.  This allows a single ``"index.md"`` entry in the skip
+    set to suppress all ``index.md`` files in the tree, not just those at the
+    root level.  Empiria-owned files (``_EMPIRIA_FILES``) are always excluded.
     """
     skip = skip or set()
     out: dict[str, str] = {}
@@ -197,9 +211,9 @@ def _walk_files(root: Path, *, skip: set[str] | None = None) -> dict[str, str]:
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        rel = path.relative_to(root).as_posix()
-        if rel in skip:
+        if path.name in skip:
             continue
+        rel = path.relative_to(root).as_posix()
         out[rel] = _sha256_of_file(path)
     return out
 
@@ -261,4 +275,68 @@ def diff_all(vault_path: Path) -> list[str]:
     all_differing: list[str] = []
     for entry in entries:
         all_differing.extend(diff_entry(entry, vault_path))
+    return sorted(all_differing)
+
+
+def diff_local(vault_path: Path) -> list[str]:
+    """Return sorted list of drifted paths using the local ``.upstream-shas`` sidecar.
+
+    Network-free alternative to :func:`diff_all` — compares committed copy files
+    against the sha256 manifest written by :func:`refresh_entry` into each
+    ``upstream_owned`` directory.  Called by ``mnemosyne doctor --vendored-drift``
+    so it works in CI environments that don't allow outbound git-clone traffic.
+
+    Drift rules
+    -----------
+    - Entry path absent in vault → skip (entry not yet vendored; not drift).
+    - Subpath exists but ``{subpath}/.upstream-shas`` absent → drift (never
+      refreshed with the sidecar mechanism; operator must run refresh).
+    - Subpath exists and ``.upstream-shas`` present → compare current sha256 of
+      files against stored sha256; any mismatch is drift.
+    - Files listed in ``_EMPIRIA_FILES`` are always excluded from comparison.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        Sorted list of differing relative paths.  Empty list = no drift detected.
+    """
+    entries = load_manifest(vault_path)
+    all_differing: list[str] = []
+
+    for entry in entries:
+        dest = vault_path / entry["path"]
+        if not dest.is_dir():
+            # Entry not yet vendored — skip (not drift)
+            continue
+
+        for sub in entry.get("upstream_owned", []):
+            subpath_dir = dest / sub
+            if not subpath_dir.is_dir():
+                # Directory subpath absent — skip (may not exist in this entry)
+                continue
+
+            shas_file = subpath_dir / _SHAS_FILENAME
+            if not shas_file.exists():
+                # .upstream-shas absent: entry was vendored without the sidecar
+                # (pre-refresh).  Treat as drifted so operator runs refresh.
+                all_differing.append(f"{entry['path']}/{sub}/<no-shas-sidecar>")
+                continue
+
+            # Parse stored sha256 manifest
+            stored: dict[str, str] = {}
+            for line in shas_file.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("  ", 1)
+                if len(parts) == 2:
+                    stored[parts[1]] = parts[0]
+
+            # Compare current files against stored sha256
+            current = _walk_files(subpath_dir, skip=_EMPIRIA_FILES)
+            for rel_path in stored.keys() | current.keys():
+                if stored.get(rel_path) != current.get(rel_path):
+                    all_differing.append(f"{entry['path']}/{sub}/{rel_path}")
+
     return sorted(all_differing)
