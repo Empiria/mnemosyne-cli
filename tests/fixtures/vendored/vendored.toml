@@ -2,7 +2,7 @@
 name = "anvil-agent-references"
 upstream = "https://github.com/anvil-works/anvil-agent-references"
 path = "agents/vendored/anvil-agent-references"
-ref = "abc1234abc1234abc1234abc1234abc1234abc1234"
+ref = "abc1234abc1234abc1234abc1234abc1234abc12"
 upstream_owned = ["skills", "stubs", "reference"]
 
 [[vendored]]

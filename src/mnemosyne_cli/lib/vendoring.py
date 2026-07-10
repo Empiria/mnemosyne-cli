@@ -6,19 +6,23 @@ lists the subpaths owned by upstream, and is synced by `mnemosyne refresh`.
 Public API
 ----------
 - :func:`load_manifest`   — parse agents/vendored.toml into entry dicts
-- :func:`refresh_entry`   — clone upstream, sync upstream_owned subpaths, write .upstream-ref, stage
+- :func:`refresh_entry`   — sync one entry's upstream_owned subpaths at its pinned ref
 - :func:`refresh_all`     — iterate entries, optionally filtering by name
+- :func:`set_pin`         — rewrite one entry's `ref` in vendored.toml, preserving comments
 - :func:`diff_entry`      — sha256 drift diff for one entry's upstream_owned subpaths
 - :func:`diff_all`        — drift diff across all entries
 
-Design invariants (D-06 / T-54-03)
------------------------------------
-- `refresh_entry` STAGES via `git add` and NEVER commits.  The operator reviews
-  the staged diff and commits with a gitmoji message.  This is the supply-chain
-  review gate: a force-pushed upstream cannot silently enter history.
-- SHA pin: the vendored.toml entry carries a pinned `ref` (SHA or tag).  For
-  master-tracked repos with no tags (e.g. anvil-agent-references), the engine
-  shallow-clones master and asserts HEAD == pinned SHA, flagging if it moved.
+Design invariants (D-06 / T-54-03, revised)
+-------------------------------------------
+- The `ref` in vendored.toml is a real pin: `refresh_entry` syncs the content at
+  that exact ref, never whatever the default branch happens to be.  When upstream
+  has advanced past the pin, the entry still syncs at the pin and the result
+  reports `advanced=True` so the caller can tell the operator.  Advancing the pin
+  is an explicit act (`refresh --accept-upstream`), never a side effect of refresh.
+- `refresh_entry` NEITHER stages NOR commits.  It leaves changes in the working
+  tree.  This is the supply-chain review gate: upstream content cannot enter
+  history without the operator staging it deliberately, so it can never be swept
+  into an unrelated `git commit`.
 - Empiria-authored files (`index.md`, `.upstream-ref`) are NEVER in
   `upstream_owned` and are never overwritten by a sync.
 """
@@ -26,10 +30,12 @@ Design invariants (D-06 / T-54-03)
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import subprocess
 import tempfile
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -43,6 +49,28 @@ _EMPIRIA_FILES: set[str] = {"index.md", ".upstream-ref", ".upstream-shas"}
 # Name of the local sha256 sidecar written by refresh_entry into each
 # upstream_owned subpath.  Used by diff_local for network-free drift detection.
 _SHAS_FILENAME = ".upstream-shas"
+
+
+class VendoringError(RuntimeError):
+    """Raised when an entry cannot be synced at its pinned ref."""
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    """Outcome of syncing one vendored entry.
+
+    Attributes:
+        name:          Entry name from the manifest.
+        synced_sha:    Commit SHA whose content now sits in the working tree.
+        upstream_head: Commit SHA at the tip of upstream's default branch.
+        advanced:      True when upstream's tip has moved past the synced commit,
+                       i.e. there is new upstream content the pin is holding back.
+    """
+
+    name: str
+    synced_sha: str
+    upstream_head: str
+    advanced: bool
 
 
 # ---------------------------------------------------------------------------
@@ -77,31 +105,102 @@ def load_manifest(vault_path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def refresh_entry(entry: dict, vault_path: Path) -> str:
-    """Shallow-clone upstream, sync ``upstream_owned`` subpaths, stage (never commit).
+# A hex pin (full or abbreviated) must prefix the commit it resolves to.  Tag
+# pins are opaque and cannot be checked this way.
+_HEX_PIN_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _rev_parse(repo: Path, rev: str = "HEAD") -> str:
+    """Return the commit SHA that *rev* resolves to inside *repo*."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", rev],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _checkout_pin(repo: Path, pin: str, upstream: str) -> str:
+    """Check out *pin* inside the shallow clone *repo*, returning its commit SHA.
+
+    Fetching a bare SHA needs `uploadpack.allowAnySHA1InWant` on the server (GitHub
+    and GitLab both allow it).  When the server refuses, deepen the clone instead
+    so the pin becomes reachable by name.
+    """
+    fetched = subprocess.run(
+        ["git", "-C", str(repo), "fetch", "--depth", "1", "origin", pin],
+        capture_output=True,
+        text=True,
+    )
+    if fetched.returncode == 0:
+        # FETCH_HEAD is only trustworthy when the fetch actually succeeded.
+        targets = ("FETCH_HEAD", pin)
+    else:
+        subprocess.run(
+            ["git", "-C", str(repo), "fetch", "--unshallow"],
+            capture_output=True,
+            text=True,
+        )
+        targets = (pin,)
+
+    for target in targets:
+        checked = subprocess.run(
+            ["git", "-C", str(repo), "checkout", "--detach", target],
+            capture_output=True,
+            text=True,
+        )
+        if checked.returncode == 0:
+            return _rev_parse(repo)
+
+    raise VendoringError(
+        f"cannot check out pinned ref {pin!r} from {upstream} — "
+        f"the ref may have been force-pushed away or garbage-collected"
+    )
+
+
+def refresh_entry(
+    entry: dict, vault_path: Path, *, accept_upstream: bool = False
+) -> RefreshResult:
+    """Sync one entry's ``upstream_owned`` subpaths at its pinned ref.
 
     Algorithm
     ---------
-    1. Create a ``tempfile.TemporaryDirectory``.
-    2. ``git clone --depth 1 <upstream> <tmp>`` (always clones master/default branch).
-    3. ``git -C <tmp> rev-parse HEAD`` — resolve current upstream HEAD SHA.
-    4. Sync each subpath listed in ``entry["upstream_owned"]``:
-       - If a directory: ``shutil.rmtree(dst)`` then ``shutil.copytree(src, dst)``.
-       - If a file: ``shutil.copy2(src, dst)`` (creates parent dirs as needed).
-       - Subpaths absent in the upstream clone are left as-is (not deleted).
-    5. Write ``<dest>/.upstream-ref`` = resolved HEAD SHA (provenance record).
-       This file is NOT in ``upstream_owned`` — it is Empiria-owned.
-    6. ``git -C <vault_path> add <path>`` — stages the entire vendored subtree.
-       NEVER issues a ``git commit``.
+    1. Shallow-clone the upstream default branch into a temp directory and
+       resolve its tip (``upstream_head``).
+    2. Unless *accept_upstream*, check out ``entry["ref"]`` — the pin — so the
+       content copied out is the pinned content, not the default-branch tip.
+    3. Sync each subpath listed in ``entry["upstream_owned"]``:
+       - directory: ``shutil.rmtree(dst)`` then ``shutil.copytree(src, dst)``
+       - file: ``shutil.copy2(src, dst)`` (creating parent dirs as needed)
+       - absent upstream: left as-is (not deleted)
+    4. Write ``<dest>/.upstream-ref`` = the synced SHA (provenance record).  This
+       file is NOT in ``upstream_owned`` — it is Empiria-owned.
+
+    Changes are left in the working tree: nothing is staged and nothing is
+    committed.  Staging is the operator's deliberate act.
 
     Args:
-        entry:      Manifest entry dict (from :func:`load_manifest`).
-        vault_path: Vault root.
+        entry:           Manifest entry dict (from :func:`load_manifest`).
+        vault_path:      Vault root.
+        accept_upstream: Sync the default-branch tip instead of the pin.  The
+                         caller is responsible for writing the new pin back via
+                         :func:`set_pin`.
 
     Returns:
-        The resolved HEAD SHA of the upstream clone (the value written to
-        ``.upstream-ref``).
+        A :class:`RefreshResult` describing what was synced and whether upstream
+        has advanced past it.
+
+    Raises:
+        VendoringError: the entry has no ``ref``, or the pin cannot be checked out.
     """
+    pin = str(entry.get("ref") or "").strip()
+    if not pin and not accept_upstream:
+        raise VendoringError(
+            f"vendored entry {entry['name']!r} has no 'ref' pin — refusing to sync "
+            f"an unpinned upstream.  Add a ref to agents/vendored.toml."
+        )
+
     dest = vault_path / entry["path"]
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -109,24 +208,26 @@ def refresh_entry(entry: dict, vault_path: Path) -> str:
     with tmp_ctx:
         tmp = Path(tmp_ctx.name)
 
-        # Step 2: shallow clone upstream master/default branch
         subprocess.run(
             ["git", "clone", "--depth", "1", entry["upstream"], str(tmp)],
             check=True,
             capture_output=True,
             text=True,
         )
+        upstream_head = _rev_parse(tmp)
 
-        # Step 3: resolve HEAD SHA — flag if it moved from the pinned ref
-        rev_result = subprocess.run(
-            ["git", "-C", str(tmp), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        head_sha = rev_result.stdout.strip()
+        if accept_upstream or pin == upstream_head:
+            synced_sha = upstream_head
+        else:
+            synced_sha = _checkout_pin(tmp, pin, entry["upstream"])
+            # A hex pin must resolve to the commit it names; anything else means
+            # we copied content the operator never reviewed.
+            if _HEX_PIN_RE.match(pin) and not synced_sha.startswith(pin):
+                raise VendoringError(
+                    f"{entry['name']}: pinned ref {pin} resolved to {synced_sha} — "
+                    f"refusing to sync content that does not match the pin"
+                )
 
-        # Step 4: sync only upstream_owned subpaths
         for sub in entry.get("upstream_owned", []):
             src = tmp / sub
             dst = dest / sub
@@ -134,8 +235,7 @@ def refresh_entry(entry: dict, vault_path: Path) -> str:
                 if dst.exists():
                     shutil.rmtree(dst)
                 shutil.copytree(src, dst)
-                # Step 4a: write .upstream-shas sidecar inside the synced dir
-                # so diff_local can detect drift without a network clone.
+                # Sidecar of sha256s so diff_local detects drift without a clone.
                 shas = _walk_files(dst, skip=_EMPIRIA_FILES)
                 shas_lines = "".join(
                     f"{sha}  {rel}\n" for rel, sha in sorted(shas.items())
@@ -146,40 +246,72 @@ def refresh_entry(entry: dict, vault_path: Path) -> str:
                 shutil.copy2(src, dst)
             # If absent in upstream, leave existing content in place
 
-        # Step 5: write provenance file (Empiria-owned, never in upstream_owned)
-        (dest / ".upstream-ref").write_text(head_sha + "\n")
+        (dest / ".upstream-ref").write_text(synced_sha + "\n")
 
-    # Step 6: stage the vendored subtree (NEVER commit — D-06 / T-54-03)
-    subprocess.run(
-        ["git", "-C", str(vault_path), "add", entry["path"]],
-        check=True,
-        capture_output=True,
-        text=True,
+    return RefreshResult(
+        name=entry["name"],
+        synced_sha=synced_sha,
+        upstream_head=upstream_head,
+        advanced=upstream_head != synced_sha,
     )
 
-    return head_sha
 
-
-def refresh_all(vault_path: Path, names: list[str] | None = None) -> dict[str, str]:
+def refresh_all(
+    vault_path: Path,
+    names: list[str] | None = None,
+    *,
+    accept_upstream: bool = False,
+) -> dict[str, RefreshResult]:
     """Refresh all (or named) manifest entries.
 
     Args:
-        vault_path: Vault root.
-        names:      Optional list of entry names to refresh.  When ``None``
-                    (or empty), all entries are refreshed.
+        vault_path:      Vault root.
+        names:           Optional list of entry names to refresh.  When ``None``
+                         (or empty), all entries are refreshed.
+        accept_upstream: Passed through to :func:`refresh_entry`.
 
     Returns:
-        Dict mapping ``{entry_name: resolved_head_sha}`` for each entry
-        processed.
+        Dict mapping ``{entry_name: RefreshResult}`` for each entry processed.
     """
     entries = load_manifest(vault_path)
-    results: dict[str, str] = {}
+    results: dict[str, RefreshResult] = {}
     for entry in entries:
         if names and entry["name"] not in names:
             continue
-        head = refresh_entry(entry, vault_path)
-        results[entry["name"]] = head
+        results[entry["name"]] = refresh_entry(
+            entry, vault_path, accept_upstream=accept_upstream
+        )
     return results
+
+
+def set_pin(vault_path: Path, name: str, new_ref: str) -> None:
+    """Rewrite the ``ref`` of the ``[[vendored]]`` entry *name* in vendored.toml.
+
+    Edits the quoted value in place rather than round-tripping through a TOML
+    writer, because the manifest carries operator commentary that a serialiser
+    would discard.
+
+    Raises:
+        VendoringError: no ``[[vendored]]`` block for *name*, or it has no ``ref``.
+    """
+    manifest_path = vault_path / "agents" / "vendored.toml"
+    lines = manifest_path.read_text().splitlines(keepends=True)
+
+    in_target = False
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[[vendored]]":
+            in_target = False
+            continue
+        if re.match(r'^name\s*=\s*"' + re.escape(name) + r'"', stripped):
+            in_target = True
+            continue
+        if in_target and re.match(r"^ref\s*=", stripped):
+            lines[idx] = re.sub(r'(ref\s*=\s*")[^"]*(")', rf"\g<1>{new_ref}\g<2>", line)
+            manifest_path.write_text("".join(lines))
+            return
+
+    raise VendoringError(f"no vendored entry named {name!r} with a 'ref' in {manifest_path}")
 
 
 # ---------------------------------------------------------------------------

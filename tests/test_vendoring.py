@@ -1,18 +1,14 @@
-"""RED tests for mnemosyne_cli.lib.vendoring — vendoring engine contract.
-
-Phase 54 Plan 03 (Wave 0): these tests lock the behavioural contract for the
-vendoring engine and the 'mnemosyne refresh' vendored-section extension before
-any implementation lands (Plans 04/05). They MUST fail RED until the Wave 2
-implementation provides lib/vendoring.py and the refresh vendored section.
+"""Tests for mnemosyne_cli.lib.vendoring — vendoring engine contract.
 
 Contracts under test:
   - load_manifest(vault_path) — parse agents/vendored.toml into entry dicts
-  - refresh_entry(entry, vault_path) — clone upstream, sync upstream_owned
-    subpaths, preserve Empiria files, write .upstream-ref, stage (never commit)
+  - refresh_entry(entry, vault_path) — clone upstream, check out the PINNED ref,
+    sync upstream_owned subpaths, preserve Empiria files, write .upstream-ref,
+    and leave the result unstaged (neither `git add` nor `git commit`)
+  - set_pin(vault_path, name, ref) — rewrite one entry's pin, keeping comments
   - CliRunner: refresh (all), refresh <name> (one), refresh <unknown> (error)
 
-Lazy imports inside each test body (Phase 38 convention) so pytest --collect-only
-succeeds before lib/vendoring.py exists.
+Lazy imports inside each test body (Phase 38 convention).
 """
 
 from __future__ import annotations
@@ -26,6 +22,8 @@ from typer.testing import CliRunner
 from mnemosyne_cli.commands import refresh
 from mnemosyne_cli.lib import vault
 from mnemosyne_cli.main import app
+
+from conftest import shallow_clone_run
 
 
 runner = CliRunner()
@@ -87,13 +85,7 @@ def fake_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(refresh.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     calls: list[list[str]] = []
-    NEW_SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-
-    def fake_run(args, *a, **k):
-        # Simulate rev-parse HEAD returning a fresh upstream SHA
-        if args[:3] == ["git", "-C"] and "rev-parse" in args:
-            return MagicMock(returncode=0, stdout=NEW_SHA + "\n", stderr="")
-        return MagicMock(returncode=0, stdout="", stderr="")
+    fake_run = shallow_clone_run("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 
     # Capture subprocess calls: patch the module-level subprocess in refresh
     # AND the vendoring lib (both use subprocess.run)
@@ -155,17 +147,20 @@ def test_load_manifest_returns_all_vendored_sections(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+FIXTURE_PIN = "abc1234abc1234abc1234abc1234abc1234abc12"
+FIXTURE_UPSTREAM_HEAD = "cafebabecafebabecafebabecafebabecafebabe"
+
+
 def test_refresh_entry_invokes_git_clone(tmp_path, monkeypatch):
     """refresh_entry triggers git clone --depth 1 (mocked — no network)."""
     vault_path = _seed_vault_with_manifest(tmp_path)
-    NEW_SHA = "cafebabecafebabecafebabecafebabecafebabe"
     calls: list[list[str]] = []
+
+    inner = _pinned_run(FIXTURE_PIN, FIXTURE_UPSTREAM_HEAD)
 
     def fake_run(args, *a, **k):
         calls.append(list(args))
-        if "rev-parse" in args:
-            return MagicMock(returncode=0, stdout=NEW_SHA + "\n", stderr="")
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return inner(args, *a, **k)
 
     from mnemosyne_cli.lib.vendoring import load_manifest, refresh_entry  # lazy import
 
@@ -180,28 +175,169 @@ def test_refresh_entry_invokes_git_clone(tmp_path, monkeypatch):
     assert "--depth" in clone_calls[0], "clone must be shallow (--depth 1)"
 
 
-def test_refresh_entry_writes_upstream_ref(tmp_path, monkeypatch):
-    """refresh_entry writes .upstream-ref with the resolved HEAD SHA."""
-    vault_path = _seed_vault_with_manifest(tmp_path)
-    NEW_SHA = "cafebabecafebabecafebabecafebabecafebabe"
+def _pinned_run(pin: str, upstream_head: str):
+    """Fake subprocess.run where HEAD is *upstream_head* until the pin is checked out.
+
+    Mirrors a real shallow clone: `rev-parse HEAD` yields the default-branch tip,
+    and only after `checkout --detach` does it yield the pinned commit.
+    """
+    state = {"checked_out": False}
 
     def fake_run(args, *a, **k):
+        if "checkout" in args:
+            state["checked_out"] = True
+            return MagicMock(returncode=0, stdout="", stderr="")
         if "rev-parse" in args:
-            return MagicMock(returncode=0, stdout=NEW_SHA + "\n", stderr="")
+            sha = pin if state["checked_out"] else upstream_head
+            return MagicMock(returncode=0, stdout=sha + "\n", stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
+
+    return fake_run
+
+
+def test_refresh_entry_writes_pinned_sha_to_upstream_ref(tmp_path, monkeypatch):
+    """.upstream-ref records the PINNED sha, not the upstream default-branch tip."""
+    vault_path = _seed_vault_with_manifest(tmp_path)
+    PIN = "abc1234abc1234abc1234abc1234abc1234abc12"  # matches the fixture
+    UPSTREAM_HEAD = "cafebabecafebabecafebabecafebabecafebabe"
 
     from mnemosyne_cli.lib.vendoring import load_manifest, refresh_entry  # lazy import
 
-    monkeypatch.setattr("mnemosyne_cli.lib.vendoring.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "mnemosyne_cli.lib.vendoring.subprocess.run", _pinned_run(PIN, UPSTREAM_HEAD)
+    )
+
+    entries = load_manifest(vault_path)
+    anvil_entry = next(e for e in entries if e["name"] == "anvil-agent-references")
+    result = refresh_entry(anvil_entry, vault_path)
+
+    upstream_ref_path = vault_path / "agents" / "vendored" / "anvil-agent-references" / ".upstream-ref"
+    content = upstream_ref_path.read_text().strip()
+    assert content == PIN, (
+        f".upstream-ref must record the pinned sha, not upstream HEAD; got {content!r}"
+    )
+    assert result.synced_sha == PIN
+    assert result.upstream_head == UPSTREAM_HEAD
+    assert result.advanced is True, "upstream moved past the pin — must be reported"
+
+
+def test_refresh_entry_checks_out_the_pin(tmp_path, monkeypatch):
+    """refresh_entry checks out entry['ref'] rather than syncing the clone tip."""
+    vault_path = _seed_vault_with_manifest(tmp_path)
+    PIN = "abc1234abc1234abc1234abc1234abc1234abc12"
+    calls: list[list[str]] = []
+
+    inner = _pinned_run(PIN, "cafebabecafebabecafebabecafebabecafebabe")
+
+    def capturing(args, *a, **k):
+        calls.append(list(args))
+        return inner(args, *a, **k)
+
+    from mnemosyne_cli.lib.vendoring import load_manifest, refresh_entry  # lazy import
+
+    monkeypatch.setattr("mnemosyne_cli.lib.vendoring.subprocess.run", capturing)
 
     entries = load_manifest(vault_path)
     anvil_entry = next(e for e in entries if e["name"] == "anvil-agent-references")
     refresh_entry(anvil_entry, vault_path)
 
-    upstream_ref_path = vault_path / "agents" / "vendored" / "anvil-agent-references" / ".upstream-ref"
-    assert upstream_ref_path.exists(), ".upstream-ref must be written by refresh_entry"
-    content = upstream_ref_path.read_text().strip()
-    assert content == NEW_SHA, f".upstream-ref must contain the resolved SHA; got {content!r}"
+    checkout_calls = [c for c in calls if "checkout" in c]
+    assert checkout_calls, f"expected a checkout of the pin; got: {calls}"
+    assert any(PIN in c or "FETCH_HEAD" in c for c in checkout_calls), (
+        f"checkout must target the pinned ref; got: {checkout_calls}"
+    )
+
+
+def test_refresh_entry_rejects_pin_that_resolves_elsewhere(tmp_path, monkeypatch):
+    """A full-sha pin that does not resolve to itself is a hard failure."""
+    vault_path = _seed_vault_with_manifest(tmp_path)
+    WRONG = "0000000000000000000000000000000000000000"
+
+    from mnemosyne_cli.lib.vendoring import (  # lazy import
+        VendoringError,
+        load_manifest,
+        refresh_entry,
+    )
+
+    # checkout "succeeds" but HEAD resolves to something other than the pin
+    monkeypatch.setattr(
+        "mnemosyne_cli.lib.vendoring.subprocess.run",
+        _pinned_run(WRONG, "cafebabecafebabecafebabecafebabecafebabe"),
+    )
+
+    entries = load_manifest(vault_path)
+    anvil_entry = next(e for e in entries if e["name"] == "anvil-agent-references")
+    with pytest.raises(VendoringError, match="does not match the pin"):
+        refresh_entry(anvil_entry, vault_path)
+
+
+def test_refresh_entry_accept_upstream_syncs_the_tip(tmp_path, monkeypatch):
+    """--accept-upstream syncs the default-branch tip and reports no advance."""
+    vault_path = _seed_vault_with_manifest(tmp_path)
+    UPSTREAM_HEAD = "cafebabecafebabecafebabecafebabecafebabe"
+
+    from mnemosyne_cli.lib.vendoring import load_manifest, refresh_entry  # lazy import
+
+    monkeypatch.setattr(
+        "mnemosyne_cli.lib.vendoring.subprocess.run",
+        _pinned_run("unused", UPSTREAM_HEAD),
+    )
+
+    entries = load_manifest(vault_path)
+    anvil_entry = next(e for e in entries if e["name"] == "anvil-agent-references")
+    result = refresh_entry(anvil_entry, vault_path, accept_upstream=True)
+
+    assert result.synced_sha == UPSTREAM_HEAD
+    assert result.advanced is False
+
+
+def test_refresh_entry_refuses_entry_without_a_pin(tmp_path, monkeypatch):
+    """An entry with no 'ref' is refused rather than silently tracking master."""
+    vault_path = _seed_vault_with_manifest(tmp_path)
+
+    from mnemosyne_cli.lib.vendoring import VendoringError, refresh_entry  # lazy import
+
+    monkeypatch.setattr(
+        "mnemosyne_cli.lib.vendoring.subprocess.run",
+        _pinned_run("x", "cafebabecafebabecafebabecafebabecafebabe"),
+    )
+
+    unpinned = {
+        "name": "unpinned",
+        "upstream": "https://example.invalid/repo",
+        "path": "agents/vendored/unpinned",
+        "upstream_owned": ["skills"],
+    }
+    with pytest.raises(VendoringError, match="no 'ref' pin"):
+        refresh_entry(unpinned, vault_path)
+
+
+def test_set_pin_rewrites_ref_and_preserves_comments(tmp_path):
+    """set_pin updates only the ref value, leaving operator commentary intact."""
+    vault_path = tmp_path / "vault"
+    (vault_path / "agents").mkdir(parents=True)
+    manifest = vault_path / "agents" / "vendored.toml"
+    manifest.write_text(
+        "# header comment\n"
+        "[[vendored]]\n"
+        'name = "anvil-agent-references"\n'
+        'ref = "aaaa"   # no tags exist; SHA on master\n'
+        "\n"
+        "[[vendored]]\n"
+        'name = "obsidian-skills"\n'
+        'ref = "bbbb"\n'
+    )
+
+    from mnemosyne_cli.lib.vendoring import set_pin  # lazy import
+
+    set_pin(vault_path, "anvil-agent-references", "cccc")
+    text = manifest.read_text()
+
+    assert 'ref = "cccc"   # no tags exist; SHA on master' in text, (
+        "set_pin must replace the value and preserve the trailing comment"
+    )
+    assert "# header comment" in text
+    assert 'ref = "bbbb"' in text, "set_pin must not touch other entries"
 
 
 def test_refresh_entry_preserves_empiria_index_md(tmp_path, monkeypatch):
@@ -210,16 +346,13 @@ def test_refresh_entry_preserves_empiria_index_md(tmp_path, monkeypatch):
     original_index = (
         vault_path / "agents" / "vendored" / "anvil-agent-references" / "index.md"
     ).read_text()
-    NEW_SHA = "cafebabecafebabecafebabecafebabecafebabe"
-
-    def fake_run(args, *a, **k):
-        if "rev-parse" in args:
-            return MagicMock(returncode=0, stdout=NEW_SHA + "\n", stderr="")
-        return MagicMock(returncode=0, stdout="", stderr="")
 
     from mnemosyne_cli.lib.vendoring import load_manifest, refresh_entry  # lazy import
 
-    monkeypatch.setattr("mnemosyne_cli.lib.vendoring.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "mnemosyne_cli.lib.vendoring.subprocess.run",
+        _pinned_run(FIXTURE_PIN, FIXTURE_UPSTREAM_HEAD),
+    )
 
     entries = load_manifest(vault_path)
     anvil_entry = next(e for e in entries if e["name"] == "anvil-agent-references")
@@ -233,41 +366,45 @@ def test_refresh_entry_preserves_empiria_index_md(tmp_path, monkeypatch):
     )
 
 
-def test_refresh_entry_stages_but_never_commits(tmp_path, monkeypatch):
-    """refresh_entry stages via git add but NEVER calls git commit (D-06 / T-54-03)."""
+def test_refresh_entry_neither_stages_nor_commits(tmp_path, monkeypatch):
+    """refresh_entry leaves changes in the working tree — no git add, no git commit.
+
+    Staging is the operator's deliberate act. If refresh staged, the next
+    unrelated `git commit` would sweep unreviewed upstream content into history.
+    """
     vault_path = _seed_vault_with_manifest(tmp_path)
-    NEW_SHA = "cafebabecafebabecafebabecafebabecafebabe"
+    PIN = "abc1234abc1234abc1234abc1234abc1234abc12"
     calls: list[list[str]] = []
 
-    def fake_run(args, *a, **k):
+    inner = _pinned_run(PIN, "cafebabecafebabecafebabecafebabecafebabe")
+
+    def capturing(args, *a, **k):
         calls.append(list(args))
-        if "rev-parse" in args:
-            return MagicMock(returncode=0, stdout=NEW_SHA + "\n", stderr="")
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return inner(args, *a, **k)
 
     from mnemosyne_cli.lib.vendoring import load_manifest, refresh_entry  # lazy import
 
-    monkeypatch.setattr("mnemosyne_cli.lib.vendoring.subprocess.run", fake_run)
+    monkeypatch.setattr("mnemosyne_cli.lib.vendoring.subprocess.run", capturing)
 
     entries = load_manifest(vault_path)
     anvil_entry = next(e for e in entries if e["name"] == "anvil-agent-references")
     refresh_entry(anvil_entry, vault_path)
 
-    # T-54-03: stage-not-commit invariant — no call must contain "commit"
     commit_calls = [c for c in calls if "commit" in c]
     assert commit_calls == [], (
         f"refresh_entry must NEVER invoke git commit; found: {commit_calls}"
     )
 
-    # Must have at least one git add call
-    add_calls = [c for c in calls if "add" in c]
-    assert len(add_calls) >= 1, f"Expected git add call to stage the path; got calls: {calls}"
+    # `git add` on the vault — distinct from a clone's internal plumbing
+    add_calls = [c for c in calls if c[:1] == ["git"] and "add" in c]
+    assert add_calls == [], (
+        f"refresh_entry must NOT stage; the operator stages after review. Found: {add_calls}"
+    )
 
 
 def test_refresh_entry_syncs_only_upstream_owned_subpaths(tmp_path, monkeypatch):
     """refresh_entry copies only upstream_owned subpaths (not the whole tree)."""
     vault_path = _seed_vault_with_manifest(tmp_path)
-    NEW_SHA = "cafebabecafebabecafebabecafebabecafebabe"
 
     # Create a fake upstream clone dir that includes both an upstream_owned path
     # and a file that should NOT be copied (simulating non-upstream content)
@@ -278,19 +415,13 @@ def test_refresh_entry_syncs_only_upstream_owned_subpaths(tmp_path, monkeypatch)
     (upstream_dir / "skills" / "new-skill.md").write_text("# New upstream skill\n")
     (upstream_dir / "extra-non-upstream.md").write_text("# Should not be copied\n")
 
-    def fake_run(args, *a, **k):
-        if "clone" in args:
-            # Simulate clone populating the tempdir — not needed since we use a pre-built dir
-            return MagicMock(returncode=0, stdout="", stderr="")
-        if "rev-parse" in args:
-            return MagicMock(returncode=0, stdout=NEW_SHA + "\n", stderr="")
-        return MagicMock(returncode=0, stdout="", stderr="")
-
     from mnemosyne_cli.lib.vendoring import load_manifest, refresh_entry  # lazy import
 
-    monkeypatch.setattr("mnemosyne_cli.lib.vendoring.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "mnemosyne_cli.lib.vendoring.subprocess.run",
+        _pinned_run(FIXTURE_PIN, FIXTURE_UPSTREAM_HEAD),
+    )
     # Patch the tempdir creation so refresh_entry uses our pre-built upstream_dir
-    import tempfile as tempfile_mod
     monkeypatch.setattr(
         "mnemosyne_cli.lib.vendoring.tempfile.TemporaryDirectory",
         lambda: _FakeTempDir(str(upstream_dir)),
@@ -332,9 +463,7 @@ def test_cli_refresh_all_runs_vendored_section(fake_env):
     """'mnemosyne refresh' (no args) processes all sections including each vendored entry."""
     vault_path, calls = fake_env
     result = runner.invoke(app, ["refresh"])
-    # The command should not crash (even if vendoring lib absent — test exits non-zero RED)
-    # We assert that this test itself fails RED since lib/vendoring.py doesn't exist yet.
-    # Once the implementation lands, this assert will check for clone calls.
+    assert result.exit_code == 0, f"Expected exit 0; got {result.exit_code}\n{result.output}"
     clone_calls = [c for c in calls if "clone" in c]
     assert len(clone_calls) >= 2, (
         f"refresh (no args) must clone each vendored.toml entry; got calls: {calls}"

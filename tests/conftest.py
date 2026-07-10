@@ -3,8 +3,34 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+
+
+def shallow_clone_run(upstream_head: str):
+    """Build a fake `subprocess.run` that behaves like a real shallow clone.
+
+    `rev-parse HEAD` yields *upstream_head* after a clone, and only after the
+    pinned ref has been fetched and checked out does it yield that pin. Vendoring
+    refuses to sync when a hex pin does not resolve to itself, so a mock that
+    always returns the same sha makes every entry look force-pushed.
+    """
+    state: dict[str, str | None] = {"fetched_pin": None, "head": upstream_head}
+
+    def fake_run(args, *a, **k):
+        if "clone" in args:
+            state["fetched_pin"] = None
+            state["head"] = upstream_head
+        elif "fetch" in args and "origin" in args:
+            state["fetched_pin"] = args[-1]
+        elif "checkout" in args:
+            state["head"] = state["fetched_pin"] or upstream_head
+        elif "rev-parse" in args:
+            return MagicMock(returncode=0, stdout=str(state["head"]) + "\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    return fake_run
 
 
 @pytest.fixture

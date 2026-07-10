@@ -22,6 +22,8 @@ from mnemosyne_cli.commands import refresh
 from mnemosyne_cli.lib import vault
 from mnemosyne_cli.main import app
 
+from conftest import shallow_clone_run
+
 
 runner = CliRunner()
 
@@ -61,12 +63,7 @@ def fake_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(refresh.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     calls: list[list[str]] = []
-    NEW_SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-
-    def fake_run(args, *a, **k):
-        if args[:3] == ["git", "-C"] and "rev-parse" in args:
-            return MagicMock(returncode=0, stdout=NEW_SHA + "\n", stderr="")
-        return MagicMock(returncode=0, stdout="", stderr="")
+    fake_run = shallow_clone_run("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 
     def capturing_run(args, *a, **k):
         calls.append(list(args))

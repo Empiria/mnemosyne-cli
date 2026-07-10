@@ -26,6 +26,19 @@ _FIXED_COMPONENTS = {"images", "qmd", "manifests"}
 
 console = Console()
 error_console = Console(stderr=True, style="bold red")
+warn_console = Console(stderr=True, style="bold yellow")
+
+
+def _working_tree_changes(vault_path, relpath: str) -> list[str]:
+    """Return `git status --porcelain` lines for *relpath*, or [] when clean."""
+    result = subprocess.run(
+        ["git", "-C", str(vault_path), "status", "--porcelain", "--", relpath],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return [line for line in (result.stdout or "").splitlines() if line.strip()]
 
 
 def run(
@@ -40,10 +53,21 @@ def run(
     ),
     skip_images: bool = typer.Option(False, "--skip-images", help="Skip agent image pull."),
     skip_qmd: bool = typer.Option(False, "--skip-qmd", help="Skip qmd index update."),
+    accept_upstream: bool = typer.Option(
+        False,
+        "--accept-upstream",
+        help=(
+            "Advance each selected vendored pin to the current upstream tip and sync "
+            "that content. Without this flag, refresh syncs the pinned ref and only "
+            "reports that upstream has moved."
+        ),
+    ),
 ) -> None:
     """Pull SCION agent images, refresh the qmd search index, regenerate learning manifests, sync vendored copies."""
     vault_path = vault.resolve_vault_path()
     failed = False
+    # Paths left dirty in the working tree — the operator must review and commit these.
+    needs_review: list[str] = []
 
     # Build the set of known component names (fixed + vendored manifest entries)
     vendored_entries = vendoring.load_manifest(vault_path)
@@ -132,6 +156,7 @@ def run(
                 manifest_count += 1
         if manifest_count:
             console.print(f"  {manifest_count} manifest(s) updated.")
+            needs_review.append("technologies/")
         else:
             console.print("  [dim]All manifests up to date.[/dim]")
 
@@ -141,17 +166,65 @@ def run(
         for entry in vendored_entries:
             if not _wants(entry["name"]):
                 continue
+            name = entry["name"]
             try:
-                head = vendoring.refresh_entry(entry, vault_path)
-                console.print(f"  [green]Staged[/green] {entry['name']} @ {head[:7]}")
-            except subprocess.CalledProcessError as exc:
-                error_console.print(f"  [red]Failed[/red] to refresh {entry['name']}: {exc}")
+                result = vendoring.refresh_entry(
+                    entry, vault_path, accept_upstream=accept_upstream
+                )
+            except (subprocess.CalledProcessError, vendoring.VendoringError) as exc:
+                error_console.print(f"  [red]Failed[/red] to refresh {name}: {exc}")
                 failed = True
+                continue
+
+            if accept_upstream:
+                vendoring.set_pin(vault_path, name, result.synced_sha)
+                console.print(
+                    f"  [green]Synced[/green] {name} @ {result.synced_sha[:7]} "
+                    f"[yellow](pin advanced)[/yellow]"
+                )
+                needs_review.append("agents/vendored.toml")
+            else:
+                console.print(
+                    f"  [green]Synced[/green] {name} @ {result.synced_sha[:7]} [dim](pinned)[/dim]"
+                )
+
+            if result.advanced and not accept_upstream:
+                warn_console.print(
+                    f"    upstream has advanced to {result.upstream_head[:7]} — "
+                    f"held back by the pin"
+                )
+                console.print(
+                    f"    [dim]to adopt it: mnemosyne refresh {name} --accept-upstream[/dim]"
+                )
+
+            changed = _working_tree_changes(vault_path, entry["path"])
+            if changed:
+                console.print(
+                    f"    [yellow]{len(changed)} file(s) changed[/yellow] in {entry['path']}"
+                )
+                needs_review.append(entry["path"])
 
     # --- Summary ---
     console.print()
     if failed:
         error_console.print("Refresh completed with errors.")
         raise typer.Exit(1)
-    else:
-        console.print("[bold green]Refresh complete.[/bold green]")
+
+    if not needs_review:
+        console.print("[bold green]Refresh complete.[/bold green] Nothing to review.")
+        return
+
+    # Refresh never stages and never commits — say plainly that the vault is now
+    # dirty and what closes the loop, or the changes sit unnoticed until some
+    # unrelated commit sweeps them into history.
+    console.print("[bold yellow]Refresh complete — action required.[/bold yellow]")
+    console.print()
+    console.print("  The vault has uncommitted changes in:")
+    for path in dict.fromkeys(needs_review):
+        console.print(f"    [cyan]{path}[/cyan]")
+    console.print()
+    console.print("  Review, then commit:")
+    console.print(f"    [dim]git -C {vault_path} status[/dim]")
+    console.print(f"    [dim]git -C {vault_path} diff -- {' '.join(dict.fromkeys(needs_review))}[/dim]")
+    console.print()
+    console.print("  Nothing was staged. Upstream content enters history only when you commit it.")
