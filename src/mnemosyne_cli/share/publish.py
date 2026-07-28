@@ -7,6 +7,8 @@ Plan 01 — content producers:
 - ``content_hash``               — SHA-256 hash of a file (``sha256:<hex>``)
 - ``stage_note``                 — copy a source note to dest with SPDX injection
 - ``strip_cross_set_wikilinks``  — replace cross-set [[links]] with alias text
+- ``published_link_target``      — shortest link target reaching a published note
+- ``rewrite_published_wikilinks``— retarget in-set [[links]] at published paths
 - ``extract_third_party``        — collect spdx:/attribution: notes from in-set
 - ``render_license``             — substitute placeholders in a licence template
 - ``render_third_party_notices`` — build THIRD-PARTY-NOTICES.md from third-party list
@@ -68,6 +70,21 @@ class PublishError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Staging format version
+# ---------------------------------------------------------------------------
+
+# Bumped whenever the staging transform changes what a given source note turns
+# into, independently of the note's own content. The write plan keys on source
+# hashes (D-05), so a transform change would otherwise leave every unchanged
+# note staged in the old format forever. `run_publish` compares this against
+# PUBLISHED.json's recorded value and rewrites the whole set when they differ.
+#
+# 1 — original: SPDX injection + cross-set link strip.
+# 2 — adds in-set wikilink rewriting to published paths.
+STAGING_VERSION = 2
+
+
+# ---------------------------------------------------------------------------
 # content_hash
 # ---------------------------------------------------------------------------
 
@@ -101,6 +118,9 @@ _KNOWLEDGE_TYPE_DIRS: frozenset[str] = frozenset(
 # expose the vault's internal organisation rather than anything the client needs.
 _VAULT_CATEGORY_DIRS: frozenset[str] = frozenset({"technologies"})
 
+# Split a wikilink target into its note path and any #heading / ^block anchor.
+_LINK_ANCHOR_RE = re.compile(r"([^#^]*)(.*)")
+
 
 def published_relpath(source_rel: str) -> str:
     """Map a source vault-relative note path to its client-facing published path.
@@ -118,11 +138,10 @@ def published_relpath(source_rel: str) -> str:
     Example: ``technologies/anvil/reference/playwright-patterns.md`` →
     ``anvil/playwright-patterns.md``.
 
-    Note: short-form Obsidian links (``[[name]]``) are unaffected by flattening
-    (they resolve by basename). A full-path in-set link that embeds the stripped
-    structure (``[[technologies/anvil/reference/forms]]``) is NOT rewritten and
-    would not resolve post-flatten — callers relying on that should prefer
-    short-form links.
+    Links are reconciled with this mapping by
+    :func:`rewrite_published_wikilinks`, which retargets every in-set link to
+    the path the note actually lands on. Short-form links (``[[name]]``) are
+    usually left alone since they resolve by basename either way.
 
     Args:
         source_rel: Vault-relative POSIX path of the source note.
@@ -285,6 +304,93 @@ def strip_cross_set_wikilinks(
         # Plain link — use alias if present, otherwise bare base
         alias = parts[1].strip() if len(parts) > 1 else base
         return alias
+
+    return WIKILINK_RE.sub(replacer, content)
+
+
+# ---------------------------------------------------------------------------
+# rewrite_published_wikilinks
+# ---------------------------------------------------------------------------
+
+
+def published_link_target(published_rel: str, basename_counts: dict[str, int]) -> str:
+    """Return the shortest link target that resolves to *published_rel*.
+
+    Obsidian resolves a bare ``[[name]]`` by basename, so a note whose basename
+    is unique in the published set needs no directory prefix. Where two notes
+    share a basename (``anvil/index.md`` and ``python/index.md``) the prefix is
+    load-bearing and the full published path is used.
+
+    Uniqueness is judged over the PUBLISHED set alone, never over the client's
+    own notes. The client vault is not ours and its contents change without us;
+    keying on it would make the same vault state publish differently on
+    different days, breaking D-09 determinism. It is also harmless in practice:
+    Obsidian prefers a same-folder match, so a short link inside the published
+    subtree finds the published note even if the client has a same-named note
+    elsewhere.
+
+    Args:
+        published_rel:   Client-facing vault-relative path (``anvil/index.md``).
+        basename_counts: Basename (no ``.md``) → how many published notes carry
+                         it.
+
+    Returns:
+        An extensionless link target: the bare basename, or the full published
+        path when that basename is not unique.
+    """
+    stem = published_rel.rsplit("/", 1)[-1].removesuffix(".md")
+    if basename_counts.get(stem, 0) == 1:
+        return stem
+    return published_rel.removesuffix(".md")
+
+
+def rewrite_published_wikilinks(
+    content: str,
+    published_targets: dict[str, str],
+    *,
+    resolver: Callable[[str], str | None],
+) -> str:
+    """Retarget in-set wikilinks at the paths their notes are published to.
+
+    :func:`published_relpath` strips the vault's category and knowledge-type
+    directories, so a source link that spells out a full vault path
+    (``[[technologies/anvil/reference/data-layer]]``) points at a directory
+    layout that does not exist in the client vault. This rewrites each such
+    link to the published location, leaving alias text, ``#heading`` and
+    ``^block`` anchors, and the ``!`` embed marker untouched.
+
+    Only links that resolve to an in-set note are touched. Links to notes
+    outside the publish are left for :func:`strip_cross_set_wikilinks` (breach
+    targets) or left alone (already-broken links in the source, which this
+    cannot invent a destination for).
+
+    Args:
+        content:           Staged note content, after any strip pass.
+        published_targets: Source vault-relative path (``.md``-suffixed) → the
+                           link target to use, from :func:`published_link_target`.
+        resolver:          Maps a wikilink base to its source vault-relative
+                           path, or ``None``. Use the walker's resolution so
+                           short-form and path-qualified links both match.
+
+    Returns:
+        The content with in-set link targets rewritten.
+    """
+
+    def replacer(match: re.Match) -> str:  # type: ignore[type-arg]
+        inner = match.group(1)
+        target, sep, alias = inner.partition("|")
+        # Keep any #heading / ^block anchor to re-attach after the new target.
+        base, anchor = _LINK_ANCHOR_RE.match(target.strip()).groups()  # type: ignore[union-attr]
+
+        source_rel = resolver(base)
+        if source_rel is None:
+            return match.group(0)
+        new_target = published_targets.get(source_rel)
+        if new_target is None or new_target == base:
+            return match.group(0)
+
+        prefix = "![[" if match.group(0).startswith("!") else "[["
+        return f"{prefix}{new_target}{anchor}{sep}{alias}]]"
 
     return WIKILINK_RE.sub(replacer, content)
 
@@ -506,6 +612,8 @@ def build_published_json(
 
     The dict carries the eight required D-08 fields:
     - ``schema_version``              — always ``"1.0"``
+    - ``staging_version``             — :data:`STAGING_VERSION`, the staging
+      transform that produced these files (drives full-rewrite invalidation)
     - ``publish_timestamp``           — UTC ISO-8601 string ending in ``Z``
       (tz-aware ``datetime.now(timezone.utc)``; no deprecated wall-clock helpers)
     - ``source_vault_sha``            — short git SHA of the source vault HEAD
@@ -527,6 +635,7 @@ def build_published_json(
     """
     return {
         "schema_version": "1.0",
+        "staging_version": STAGING_VERSION,
         "publish_timestamp": datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ"
         ),
@@ -571,6 +680,8 @@ def write_published_json(publish_root: Path, data: dict) -> None:
 def compute_write_plan(
     current_sources: dict[str, str],
     prior_published: dict | None,
+    *,
+    force_rewrite: bool = False,
 ) -> WritePlan:
     """Compute which output files need to be written or deleted (D-05).
 
@@ -590,6 +701,11 @@ def compute_write_plan(
     Args:
         current_sources:  Maps output-relative path → current ``content_hash``.
         prior_published:  The loaded ``PUBLISHED.json`` dict, or ``None``.
+        force_rewrite:    Stage every current path regardless of whether its
+                          source changed. Set when the staging transform itself
+                          has changed (see :data:`STAGING_VERSION`), since
+                          source hashes cannot detect that. Deletions are still
+                          computed from *prior_published* as normal.
 
     Returns:
         A :class:`WritePlan` with sorted ``to_write`` and ``to_delete`` lists.
@@ -605,7 +721,11 @@ def compute_write_plan(
     to_write: list[str] = []
     for rel, current_hash in current_sources.items():
         prior_entry = prior_files.get(rel)
-        if prior_entry is None or prior_entry.get("source_hash") != current_hash:
+        if (
+            force_rewrite
+            or prior_entry is None
+            or prior_entry.get("source_hash") != current_hash
+        ):
             to_write.append(rel)
 
     to_delete: list[str] = [
@@ -1235,35 +1355,36 @@ def run_publish(
             f"proceeding with in_set only:\n  {breach_list}"
         )
 
+    # Resolve wikilinks the SAME way the walker did, so short-form links
+    # (`[[anvil-uplink-testing]]`) — not just path-qualified ones — are matched.
+    # Reuses the walker's basename index and D-01 resolution. The walk above
+    # already succeeded, so no in-closure link is ambiguous; guard defensively
+    # anyway. Both staging transforms need this: the strip pass to recognise a
+    # breach target, and the link rewrite to recognise an in-set note.
+    from mnemosyne_cli.share.walker import (
+        AmbiguousLinkError,
+        _index_vault,
+        _resolve,
+    )
+
+    _link_index = _index_vault(vault_root)
+
+    def link_resolver(target: str) -> str | None:
+        try:
+            return _resolve(target, vault_root, _link_index)
+        except AmbiguousLinkError:
+            return None
+
     # Build breach_targets set for strip policy.
     # walk.excluded and walk.breach are .md-suffixed vault-relative paths;
     # strip_cross_set_wikilinks matches against the extensionless wikilink base,
     # so we strip the .md suffix when building the set (CR-01 fix).
     breach_targets: set[str] = set()
-    strip_resolver: Callable[[str], str | None] | None = None
     if policy == "strip":
         breach_targets = {
             p[:-3] if p.endswith(".md") else p
             for p in set(walk.excluded) | set(walk.breach)
         }
-        # Resolve wikilinks the SAME way the walker did, so short-form links
-        # (`[[anvil-uplink-testing]]`) — not just path-qualified ones — match a
-        # breach target and get stripped. Reuses the walker's basename index and
-        # D-01 resolution. The walk above already succeeded, so no in-closure
-        # link is ambiguous; guard defensively anyway.
-        from mnemosyne_cli.share.walker import (
-            AmbiguousLinkError,
-            _index_vault,
-            _resolve,
-        )
-
-        _strip_index = _index_vault(vault_root)
-
-        def strip_resolver(target: str) -> str | None:
-            try:
-                return _resolve(target, vault_root, _strip_index)
-            except AmbiguousLinkError:
-                return None
 
     # -----------------------------------------------------------------------
     # Step 7: Map in-set source notes to their client-facing published paths,
@@ -1295,7 +1416,30 @@ def run_publish(
         pub_to_source[pub] = rel_str
         current_sources[pub] = content_hash(source_abs)
 
-    plan = compute_write_plan(current_sources, prior)
+    # Source path → the link target that reaches it in the client vault. Built
+    # from the whole publish set (not per-note) because a basename is only
+    # unambiguous relative to everything else being published.
+    basename_counts: dict[str, int] = {}
+    for pub in pub_to_source:
+        stem = pub.rsplit("/", 1)[-1].removesuffix(".md")
+        basename_counts[stem] = basename_counts.get(stem, 0) + 1
+    published_targets: dict[str, str] = {
+        source_rel: published_link_target(pub, basename_counts)
+        for pub, source_rel in pub_to_source.items()
+    }
+
+    # A staging-transform change is invisible to the source hashes the write
+    # plan diffs on, so an unchanged note would keep its stale staged form
+    # indefinitely. Restage everything when the recorded version is behind.
+    prior_staging = (prior or {}).get("staging_version", 1)
+    restage_all = prior is not None and prior_staging != STAGING_VERSION
+    if restage_all:
+        console.print(
+            f"staging format changed (v{prior_staging} → v{STAGING_VERSION}); "
+            f"restaging all published notes"
+        )
+
+    plan = compute_write_plan(current_sources, prior, force_rewrite=restage_all)
 
     # -----------------------------------------------------------------------
     # Step 8: NO-OP GATE (D-06) — must precede all writes
@@ -1368,27 +1512,25 @@ def run_publish(
         dest_abs = publish_root / pub_rel
         dest_abs.parent.mkdir(parents=True, exist_ok=True)
 
-        # Apply strip transform for 'strip' policy, then stage via stage_note
-        # so both paths share a single SPDX-injection code path (WR-03).
+        # Transform links, then stage via stage_note so every path shares a
+        # single SPDX-injection code path (WR-03). Strip runs first so the
+        # rewrite never has to consider links that are about to be flattened
+        # to plain text.
+        content = source_abs.read_text(encoding="utf-8")
         if policy == "strip":
-            raw_content = source_abs.read_text(encoding="utf-8")
-            stripped_content = strip_cross_set_wikilinks(
-                raw_content, breach_targets, resolver=strip_resolver
+            content = strip_cross_set_wikilinks(
+                content, breach_targets, resolver=link_resolver
             )
-            staged_bytes = stage_note(
-                source_abs,
-                dest_abs,
-                client_spdx_identifier=client_spdx_identifier,
-                copyright_text=copyright_text,
-                content_override=stripped_content,
-            )
-        else:
-            staged_bytes = stage_note(
-                source_abs,
-                dest_abs,
-                client_spdx_identifier=client_spdx_identifier,
-                copyright_text=copyright_text,
-            )
+        content = rewrite_published_wikilinks(
+            content, published_targets, resolver=link_resolver
+        )
+        staged_bytes = stage_note(
+            source_abs,
+            dest_abs,
+            client_spdx_identifier=client_spdx_identifier,
+            copyright_text=copyright_text,
+            content_override=content,
+        )
 
         in_set_paths.append(source_abs)
         src_hash = content_hash(source_abs)

@@ -31,9 +31,11 @@ from mnemosyne_cli.share.publish import (
     detect_client_edits,
     extract_third_party,
     load_published_json,
+    published_link_target,
     published_relpath,
     render_license,
     render_third_party_notices,
+    rewrite_published_wikilinks,
     stage_note,
     strip_cross_set_wikilinks,
     write_published_json,
@@ -274,6 +276,121 @@ def test_strip_wikilinks_no_resolver_leaves_short_form() -> None:
     result = strip_cross_set_wikilinks(content, breach_targets)  # no resolver
 
     assert "[[uplink-testing]]" in result
+
+
+# ---------------------------------------------------------------------------
+# (e2) Rewrite in-set wikilinks to published paths
+# ---------------------------------------------------------------------------
+
+
+def test_published_link_target_prefers_bare_basename() -> None:
+    """A basename unique in the publish set needs no directory prefix."""
+    counts = {"data-layer": 1, "index": 2}
+
+    assert published_link_target("anvil/data-layer.md", counts) == "data-layer"
+
+
+def test_published_link_target_qualifies_colliding_basename() -> None:
+    """A basename carried by two published notes keeps its published path."""
+    counts = {"index": 2}
+
+    assert published_link_target("anvil/index.md", counts) == "anvil/index"
+    assert published_link_target("python/index.md", counts) == "python/index"
+
+
+def test_rewrite_wikilinks_retargets_flattened_paths() -> None:
+    """Source paths that embed stripped directory tiers are retargeted."""
+    content = (
+        "See [[technologies/anvil/reference/data-layer]] and\n"
+        "[[technologies/anvil/index|Anvil Standards]].\n"
+    )
+    published_targets = {
+        "technologies/anvil/reference/data-layer.md": "data-layer",
+        "technologies/anvil/index.md": "anvil/index",
+    }
+    resolved = {
+        "technologies/anvil/reference/data-layer": (
+            "technologies/anvil/reference/data-layer.md"
+        ),
+        "technologies/anvil/index": "technologies/anvil/index.md",
+    }
+
+    result = rewrite_published_wikilinks(
+        content, published_targets, resolver=lambda t: resolved.get(t)
+    )
+
+    assert "[[data-layer]]" in result
+    # Alias text survives the rewrite
+    assert "[[anvil/index|Anvil Standards]]" in result
+    assert "technologies/" not in result
+
+
+def test_rewrite_wikilinks_preserves_anchors_and_embeds() -> None:
+    """Heading/block anchors and the embed marker survive the rewrite."""
+    content = (
+        "Heading: [[technologies/anvil/index#Routing]]\n"
+        "Block: [[technologies/anvil/index^abc123|see here]]\n"
+        "Embed: ![[technologies/anvil/index]]\n"
+    )
+    published_targets = {"technologies/anvil/index.md": "anvil/index"}
+    resolved = {"technologies/anvil/index": "technologies/anvil/index.md"}
+
+    result = rewrite_published_wikilinks(
+        content, published_targets, resolver=lambda t: resolved.get(t)
+    )
+
+    assert "[[anvil/index#Routing]]" in result
+    assert "[[anvil/index^abc123|see here]]" in result
+    assert "![[anvil/index]]" in result
+
+
+def test_rewrite_wikilinks_leaves_short_form_and_unresolvable() -> None:
+    """Links already at their published target, and links to nothing, are untouched."""
+    content = "Fine: [[data-layer]]\nDangling: [[_anvil]]\n"
+    published_targets = {"technologies/anvil/reference/data-layer.md": "data-layer"}
+    resolved = {"data-layer": "technologies/anvil/reference/data-layer.md"}
+
+    result = rewrite_published_wikilinks(
+        content, published_targets, resolver=lambda t: resolved.get(t)
+    )
+
+    assert result == content
+
+
+def test_rewrite_wikilinks_leaves_out_of_set_links() -> None:
+    """A link resolving outside the publish set is not the rewriter's business."""
+    content = "Out: [[technologies/secret/internal]]\n"
+    resolved = {"technologies/secret/internal": "technologies/secret/internal.md"}
+
+    result = rewrite_published_wikilinks(
+        content, {}, resolver=lambda t: resolved.get(t)
+    )
+
+    assert result == content
+
+
+def test_write_plan_force_rewrite_restages_unchanged_notes() -> None:
+    """force_rewrite stages every note even when no source hash moved.
+
+    Guards the staging-version path: a transform change is invisible to source
+    hashes, so without this an unchanged note keeps its stale staged form.
+    """
+    current = {"anvil/a.md": "sha256:aaa", "anvil/b.md": "sha256:bbb"}
+    prior = {
+        "files": {
+            "anvil/a.md": {"source_hash": "sha256:aaa", "output_hash": "sha256:x"},
+            "anvil/b.md": {"source_hash": "sha256:bbb", "output_hash": "sha256:y"},
+            "anvil/gone.md": {"source_hash": "sha256:ccc", "output_hash": "sha256:z"},
+        }
+    }
+
+    unchanged = compute_write_plan(current, prior)
+    assert unchanged.to_write == []
+
+    forced = compute_write_plan(current, prior, force_rewrite=True)
+    assert forced.to_write == ["anvil/a.md", "anvil/b.md"]
+    # Deletions are still computed normally
+    assert forced.to_delete == ["anvil/gone.md"]
 
 
 # ---------------------------------------------------------------------------

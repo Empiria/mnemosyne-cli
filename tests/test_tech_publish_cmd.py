@@ -919,9 +919,15 @@ def test_strip_policy_removes_cross_set_links(tmp_path: Path) -> None:
         "Alias text from stripped wikilink not found — expected 'the internal note'"
     )
 
-    # The in-set wikilink must be preserved
-    assert "[[technologies/anvil/reference/forms]]" in staged_content, (
+    # The in-set wikilink must survive the strip pass, retargeted at the path
+    # forms.md is actually published to (anvil/forms.md, unique basename → bare
+    # link). Its source path spells out the stripped reference/ tier, which does
+    # not exist in the client vault.
+    assert "[[forms]]" in staged_content, (
         "In-set wikilink was incorrectly stripped"
+    )
+    assert "[[technologies/anvil/reference/forms]]" not in staged_content, (
+        "In-set wikilink kept its source path and would not resolve post-flatten"
     )
 
     # SPDX frontmatter must be injected (shared code path with normal staging)
