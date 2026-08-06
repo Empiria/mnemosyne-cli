@@ -24,6 +24,7 @@ from mnemosyne_cli.lib import scion_cache as lib_scion_cache
 from mnemosyne_cli.lib import symlinks as lib_symlinks
 from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib.embeds import read_embed_targets
+from mnemosyne_cli.lib.skills import classify_user_skills, sync_user_skills
 from mnemosyne_cli.lib.symlinks import (
     CheckResult,
     SKILLS_YAML_FILENAME,
@@ -754,6 +755,53 @@ def _build_checks(
                         _check_fn=_check_skills_yaml_exists,
                     )
                 )
+
+            # ~/.claude/skills — the agent-wide surface, reconciled against the
+            # vault. Nothing else keeps it current on a host checkout: skills
+            # added to the vault never appear, and skills moved between the
+            # agents/skills and agents/vendored roots leave the old symlink
+            # dangling.
+            def _check_user_skill_surface(_v: Path = vault_path) -> CheckResult:
+                report = classify_user_skills(_v)
+                missing = report["missing"]
+                repoint = report["repoint"]
+                stale = report["stale"]
+                if not (missing or repoint or stale):
+                    return CheckResult(
+                        ok=True,
+                        message=(
+                            f"{len(report['ok'])} vault skills linked under ~/.claude/skills/"
+                        ),
+                    )
+                parts = []
+                if missing:
+                    parts.append(f"{len(missing)} missing")
+                if repoint:
+                    parts.append(f"{len(repoint)} pointing at a stale target")
+                if stale:
+                    parts.append(f"{len(stale)} left over from removed skills")
+                names = sorted(entry[0] for entry in missing + repoint + stale)
+                return CheckResult(
+                    ok=False,
+                    message=(
+                        "~/.claude/skills/ out of sync with the vault: "
+                        f"{', '.join(parts)} — {', '.join(names)}"
+                    ),
+                    fix_cmd="mnemosyne doctor --fix",
+                )
+
+            def _fix_user_skill_surface(_v: Path = vault_path) -> None:
+                sync_user_skills(_v)
+
+            checks.append(
+                Check(
+                    name="~/.claude/skills matches the vault",
+                    category="Skills",
+                    _check_fn=_check_user_skill_surface,
+                    _fix_fn=_fix_user_skill_surface,
+                    fix_description="Link missing, repoint stale and prune removed vault skills",
+                )
+            )
 
             # Tech stack auto-rules — derived from AGENTS.md Tech stack: line
             agents_target = vault_project_path / "AGENTS.md"

@@ -23,3 +23,8 @@ build-backend = "uv_build"
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_home: test needs the operator home directory, not the isolated one",
+]

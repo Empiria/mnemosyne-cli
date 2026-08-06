@@ -20,7 +20,7 @@ from mnemosyne_cli.lib import vault as lib_vault
 from mnemosyne_cli.lib import vault_worktree as lib_worktree
 from mnemosyne_cli.lib.checks import run_container_checks
 from mnemosyne_cli.lib.setup import setup_claude_overlay, setup_worktree_symlinks
-from mnemosyne_cli.lib.skills import discover_vault_skills
+from mnemosyne_cli.lib.skills import sync_user_skills
 
 console = Console()
 error_console = Console(stderr=True, style="bold red")
@@ -61,6 +61,31 @@ def run(
         _run_container(project=project, target=target)
     else:
         _run_host(project=project)
+
+
+def _sync_skill_surface(vault_path: Path) -> None:
+    """Reconcile ~/.claude/skills/ against the vault (D-09, D-10).
+
+    Every vault skill becomes ~/.claude/skills/<name>/ so a Claude session can
+    invoke it regardless of the project-level skills.yaml. This is the
+    agent-wide surface; the project-scoped surface created by
+    setup_worktree_symlinks (skills.yaml-driven) is untouched.
+
+    Runs in both host and container mode — a host checkout drifts as skills are
+    added to the vault or moved between its skill roots, and until now nothing
+    reconciled it.
+    """
+    done = sync_user_skills(vault_path)
+    linked, repointed, removed = done["linked"], done["repointed"], done["removed"]
+    if linked or repointed or removed:
+        console.print(
+            f"  [green]Synced[/green] ~/.claude/skills/ "
+            f"({len(linked)} linked, {len(repointed)} repointed, {len(removed)} removed)"
+        )
+    else:
+        console.print("  [green]Checked[/green] ~/.claude/skills/ — already in sync")
+    for skipped in done["skipped"]:
+        error_console.print(f"  [yellow]Warning[/yellow] vault skill {skipped}")
 
 
 # ---------------------------------------------------------------------------
@@ -170,23 +195,7 @@ def _run_container(project: str | None, target: Path | None) -> None:
         # Non-fatal: keep going so we still register merge drivers / hooks if possible
 
     # --- Vault-wide skill surface (D-09, D-10) ---
-    # Every vault skill becomes ~/.claude/skills/<name>/ so the in-container
-    # Claude session can invoke it regardless of project-level skills.yaml.
-    # This is the agent-wide surface; the project-scoped surface created by
-    # setup_worktree_symlinks (skills.yaml-driven) is preserved unchanged.
-    user_skills_dir = Path.home() / ".claude" / "skills"
-    user_skills_dir.mkdir(parents=True, exist_ok=True)
-    linked = 0
-    for name, skill_dir in discover_vault_skills(vault_path):
-        link = user_skills_dir / name
-        try:
-            if link.is_symlink() or link.exists():
-                link.unlink()
-            link.symlink_to(skill_dir, target_is_directory=True)
-            linked += 1
-        except OSError as exc:
-            error_console.print(f"  [yellow]Warning[/yellow] vault skill {name}: {exc}")
-    console.print(f"  [green]Linked[/green] {linked} vault skills into ~/.claude/skills/")
+    _sync_skill_surface(vault_path)
 
     # --- Git exclusions (no .envrc per D-08) ---
     always_exclude = [".planning", "AGENTS.md", "CLAUDE.md"]
@@ -425,6 +434,14 @@ def _run_host(project: str | None) -> None:
             except Exception as exc:
                 error_console.print(f"  [red]Error[/red] git exclusion for {entry}: {exc}")
                 errors.append(f"git exclude: {entry}")
+
+    # --- Vault-wide skill surface (D-09, D-10) ---
+    console.rule("[bold cyan]Syncing vault skills[/bold cyan]")
+    try:
+        _sync_skill_surface(vault_path)
+    except Exception as exc:
+        error_console.print(f"  [red]Error[/red] skill surface: {exc}")
+        errors.append("skills")
 
     # --- .envrc ---
     console.rule("[bold cyan]Setting up environment[/bold cyan]")

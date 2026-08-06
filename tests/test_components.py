@@ -58,6 +58,7 @@ def test_read_multiple_components(tmp_config: Path, tmp_path: Path) -> None:
     assert set(result.keys()) == {"mnemosyne-cli", "scion", "ops"}
 
 
+@pytest.mark.real_home
 def test_read_expands_tilde(tmp_config: Path) -> None:
     _write(tmp_config, '[components.foo]\nlocal_path = "~/some/path"\n')
     result = components.read_components_config()
@@ -117,6 +118,7 @@ def test_write_preserves_other_sections(tmp_config: Path, tmp_path: Path) -> Non
     assert "[components.cli]" in body
 
 
+@pytest.mark.real_home
 def test_write_round_trips_tilde_for_home_paths(tmp_config: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     home_path = tmp_path / "projects" / "thing"

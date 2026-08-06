@@ -33,6 +33,26 @@ def shallow_clone_run(upstream_head: str):
     return fake_run
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(request, tmp_path_factory, monkeypatch) -> Path | None:
+    """Point Path.home() at a throwaway directory for every test.
+
+    init and doctor both reconcile ``~/.claude/skills/`` against the vault. With
+    the real home in scope a test that wires a tmp_path vault will link its
+    fixture skills into the operator's actual skill surface, and clobber the
+    real symlink wherever a fixture reuses a genuine skill name. Tests that need
+    to assert on the home directory take this fixture and read from it.
+
+    Mark a test ``@pytest.mark.real_home`` when it genuinely needs the operator
+    home, as the tilde-expansion tests in test_components.py do.
+    """
+    if request.node.get_closest_marker("real_home"):
+        return None
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    return home
+
+
 @pytest.fixture
 def vault_dir(tmp_path: Path) -> Path:
     """Create a minimal vault layout with a container.toml for infinite-worlds."""
